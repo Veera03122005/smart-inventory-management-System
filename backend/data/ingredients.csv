@@ -1,0 +1,7 @@
+ingredient_id,name,unit,shelf_life_days,lead_time_days,unit_cost_rs,barcode,iot_enabled,device_id,min_stock
+ING01,Chicken,kg,2,1,220,8901000000011,0,,22.8
+ING02,Mutton,kg,2,1,750,8901000000028,0,,5.4
+ING03,Basmati rice,kg,365,3,110,8901000000035,1,ESP32-RICE-01,18.0
+ING04,Cooking oil,L,180,3,150,8901000000042,1,ESP32-OIL-01,7.2
+ING05,Onion,kg,14,1,35,8901000000059,1,ESP32-ONION-01,15.0
+ING06,Tomato,kg,5,1,30,8901000000066,0,,9.0
