@@ -1,0 +1,100 @@
+{
+  "version": "1.0.0",
+  "name": "UI/UX Pro Max Design Intelligence Database",
+  "entries": [
+    {
+      "id": "style-kitchen-ops",
+      "category": "styles",
+      "title": "Kitchen Operations & Inventory Utility",
+      "tags": ["dashboard", "inventory", "restaurant", "data-density", "high-contrast"],
+      "description": "Optimized for fast-paced commercial kitchens and restaurant managers. Prioritizes instant scannability, high visual contrast under varied lighting, bold metric anchors, and touch-friendly controls.",
+      "tokens": {
+        "surface": "bg-slate-50 dark:bg-slate-900",
+        "card": "bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm",
+        "accent": "emerald-600",
+        "warning": "amber-500",
+        "danger": "rose-600",
+        "text_primary": "text-slate-900 dark:text-slate-100",
+        "text_muted": "text-slate-500 dark:text-slate-400"
+      },
+      "rules": [
+        "Keep KPI metrics large and bold (text-2xl or text-3xl font-semibold).",
+        "Use colored status pills with muted backgrounds (e.g. bg-emerald-50 text-emerald-700) rather than harsh saturated fills.",
+        "Ensure stockout or expiry warning alerts stand out immediately using high-contrast borders or warning banners."
+      ]
+    },
+    {
+      "id": "style-bento-grid",
+      "category": "styles",
+      "title": "Bento Grid Dashboard Architecture",
+      "tags": ["dashboard", "bento", "layout", "cards", "analytics"],
+      "description": "Modular layout organizing complex data into distinct functional cells with varying column and row spans. Creates clear visual rhythm without visual clutter.",
+      "tokens": {
+        "grid_container": "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4",
+        "cell": "rounded-2xl p-5 border border-slate-200/80 dark:border-slate-800 bg-white/70 dark:bg-slate-900/70 backdrop-blur-md"
+      },
+      "rules": [
+        "Span primary actionable cards (like inventory summary or today's prep) across 2 columns.",
+        "Keep peripheral quick stats or sensor status in compact 1-column cards.",
+        "Maintain consistent padding and radius across all bento cards."
+      ]
+    },
+    {
+      "id": "palette-fresh-inventory",
+      "category": "palettes",
+      "title": "Fresh Produce & Kitchen Inventory Palette",
+      "tags": ["colors", "palette", "emerald", "slate", "kitchen", "food"],
+      "description": "Balanced color system reflecting fresh ingredients, kitchen hygiene, and operational safety.",
+      "palette": {
+        "primary": {"name": "Emerald", "500": "#10b981", "600": "#059669", "700": "#047857"},
+        "neutral": {"name": "Slate", "50": "#f8fafc", "100": "#f1f5f9", "800": "#1e293b", "900": "#0f172a"},
+        "alert": {"name": "Rose", "500": "#f43f5e", "600": "#e11d48"},
+        "caution": {"name": "Amber", "500": "#f59e0b", "600": "#d97706"},
+        "iot_stream": {"name": "Sky", "500": "#0ea5e9", "600": "#0284c7"}
+      }
+    },
+    {
+      "id": "typography-data-tables",
+      "category": "typography",
+      "title": "High-Legibility Numerical & Data Table Typography",
+      "tags": ["fonts", "typography", "tables", "numbers", "tabular"],
+      "description": "Font pairing for inventory tables, ledger sheets, and real-time weight meters.",
+      "guidelines": {
+        "body_font": "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+        "data_numbers": "tabular-nums font-mono (or font-sans with font-variant-numeric: tabular-nums)",
+        "hierarchy": [
+          {"level": "KPI Value", "size": "text-3xl font-bold tracking-tight"},
+          {"level": "Card Title", "size": "text-sm font-medium uppercase tracking-wider text-slate-500"},
+          {"level": "Table Cell", "size": "text-sm font-normal text-slate-800"}
+        ]
+      }
+    },
+    {
+      "id": "stack-react-tailwind",
+      "category": "stack",
+      "title": "React 18 + Tailwind CSS Guidelines",
+      "tags": ["react", "tailwind", "typescript", "vite", "components"],
+      "description": "Standard coding conventions for component structure, styling, and accessible state management in React + Tailwind.",
+      "rules": [
+        "Encapsulate recurring design tokens in shared UI components (e.g. Button, Badge, Card, Modal in src/ui.tsx).",
+        "Avoid arbitrary inline styles (style={{ ... }}); use standard Tailwind utility classes.",
+        "Always pair hover states with active and focus-visible states: e.g. 'hover:bg-slate-100 active:bg-slate-200 focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:outline-none'.",
+        "Ensure all interactive icons include an accessible label: '<button aria-label=\"Refresh readings\"><Icon /></button>'.",
+        "Use semantic HTML: <section>, <header>, <main>, <nav>, <table>, <button>, <a>."
+      ]
+    },
+    {
+      "id": "components-iot-recharts",
+      "category": "components",
+      "title": "Recharts & IoT Live Data Visualizations",
+      "tags": ["charts", "recharts", "iot", "timeseries", "visualization"],
+      "description": "Best practices for real-time sensor streams and demand forecasting charts in Recharts.",
+      "rules": [
+        "Use responsive containers: <ResponsiveContainer width=\"100%\" height={280}>.",
+        "Format tooltips cleanly using custom Tooltip renderers with formatted date and unit labels (e.g. '24.5 kg').",
+        "Color code confidence intervals with soft fills (e.g. fill=\"#10b981\" fillOpacity={0.15}).",
+        "Provide accessible text alternatives or data table fallbacks for visually impaired users."
+      ]
+    }
+  ]
+}

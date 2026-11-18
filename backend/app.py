@@ -60,7 +60,7 @@ def users():
 @app.post("/api/users")
 @auth("owner")
 def add_user():
-    b = request.get_json(force=True)
+    b = request.get_json(force=True, silent=True) or {}
     if b.get("role") not in ("owner", "manager", "staff") or not b.get("username") or len(b.get("password", "")) < 6:
         return jsonify(error="username, role and a password of 6+ characters are required"), 422
     try:
@@ -154,7 +154,9 @@ def alerts():
 @app.post("/api/alerts/ack")
 @auth("owner", "manager")
 def ack():
-    key = (request.get_json(force=True) or {}).get("key")
+    key = (request.get_json(force=True, silent=True) or {}).get("key")
+    if not key or not isinstance(key, str):
+        return jsonify(error="valid 'key' string is required"), 400
     with db.tx() as con:
         con.execute("INSERT OR REPLACE INTO alert_acks VALUES (?,?,?)", (key, request.user["username"], iot.now_str()))
     return jsonify(status="acknowledged")
@@ -227,7 +229,7 @@ def manual_prefill():
 @app.post("/api/manual-entries")
 @auth()
 def manual_save():
-    b = request.get_json(force=True)
+    b = request.get_json(force=True, silent=True) or {}
     try:
         opening, received = float(b["opening_stock"]), float(b.get("received_qty") or 0)
         used, waste = float(b["used_qty"]), float(b.get("wastage_qty") or 0)
