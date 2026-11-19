@@ -110,5 +110,5 @@ def query(sql, args=()):
 
 
 def init_schema():
-    with tx() as con:
-        con.executescript(SCHEMA)
+    import migrations
+    migrations.run_migrations()

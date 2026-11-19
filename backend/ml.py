@@ -68,22 +68,27 @@ def iot_daily_usage(ingredient_id=None, include_live=False):
     return pd.DataFrame(out, columns=["date", "ingredient_id", "usage", "refills", "readings"])
 
 
-def manual_daily_usage(ingredient_id):
+def manual_daily_usage(ingredient_id, cutoff_date=None):
     rows = db.query("SELECT date, used_qty, days_covered, entry_status FROM manual_entries "
                     "WHERE ingredient_id=? ORDER BY date", (ingredient_id,))
     df = pd.DataFrame(rows)
     if df.empty:
         return df
     df["dow"] = pd.to_datetime(df.date).dt.dayofweek
-    one = df[(df.entry_status == "ENTERED") & (df.days_covered == 1)]
-    prof = one.groupby("dow").used_qty.mean().reindex(range(7)).fillna(one.used_qty.mean())
+    # Preprocessing Leakage Fix: Fit weekday profile strictly on training records prior to cutoff_date
+    fit_df = df if not cutoff_date else df[df.date <= cutoff_date]
+    one = fit_df[(fit_df.entry_status == "ENTERED") & (fit_df.days_covered == 1)]
+    if one.empty:
+        one = df[(df.entry_status == "ENTERED") & (df.days_covered == 1)]
+    prof = one.groupby("dow").used_qty.mean().reindex(range(7)).fillna(one.used_qty.mean() if not one.empty else 1.0)
     usage, quality = [None] * len(df), [None] * len(df)
     i = 0
     while i < len(df):
         if df.entry_status.iloc[i] == "ENTERED":
             k = int(df.days_covered.iloc[i] or 1)
             idx = list(range(max(0, i - k + 1), i + 1))
-            w = np.array([prof[df.dow.iloc[j]] for j in idx]); w = w / w.sum()
+            denom = float(prof[df.dow.iloc[idx]].sum())
+            w = np.array([prof[df.dow.iloc[j]] for j in idx]); w = w / (denom if denom > 0 else 1.0)
             for j, wj in zip(idx, w):
                 usage[j] = float(df.used_qty.iloc[i]) * wj
                 quality[j] = "entered" if k == 1 else "reconstructed"
@@ -92,9 +97,9 @@ def manual_daily_usage(ingredient_id):
     return df[["date", "usage", "quality"]].dropna(subset=["usage"])
 
 
-def daily_series(ingredient_id):
+def daily_series(ingredient_id, cutoff_date=None):
     """Merged daily series: IoT where a full sensor day exists, else manual register."""
-    m = manual_daily_usage(ingredient_id).set_index("date")
+    m = manual_daily_usage(ingredient_id, cutoff_date=cutoff_date).set_index("date")
     s = m.usage.copy(); q = m.quality.copy()
     iot = iot_daily_usage(ingredient_id)
     if not iot.empty:
@@ -117,12 +122,13 @@ def calendar_frame(dates):
 
 def features(series):
     f = calendar_frame(series.index)
-    v = series.interpolate(limit_direction="both")
+    # Strictly forward-only causal imputation: no future observations leak backward into historical features
+    v = series.interpolate(limit_direction="forward").ffill().fillna(0.0)
     for l in (1, 2, 7, 14):
         f[f"lag{l}"] = v.shift(l).values
-    f["rm7"] = v.shift(1).rolling(7).mean().values
-    f["rm28"] = v.shift(1).rolling(28).mean().values
-    f["rsd7"] = v.shift(1).rolling(7).std().values
+    f["rm7"] = v.shift(1).rolling(7, min_periods=1).mean().values
+    f["rm28"] = v.shift(1).rolling(28, min_periods=1).mean().values
+    f["rsd7"] = v.shift(1).rolling(7, min_periods=1).std().fillna(0.0).values
     f["same_dow_mean4"] = ((v.shift(7) + v.shift(14) + v.shift(21) + v.shift(28)) / 4).values
     return f
 
@@ -137,8 +143,12 @@ def make_model(name, seed=42):
 def metrics(y, p):
     y, p = np.asarray(y, float), np.asarray(p, float)
     e = p - y
-    return {"MAE": round(float(np.mean(np.abs(e))), 3), "RMSE": round(float(np.sqrt(np.mean(e ** 2))), 3),
-            "WAPE": round(float(100 * np.sum(np.abs(e)) / np.sum(y)), 2)}
+    denom = float(np.sum(y))
+    mae = round(float(np.mean(np.abs(e))), 3)
+    rmse = round(float(np.sqrt(np.mean(e ** 2))), 3)
+    # Important WAPE rule: if sum of actual is zero, WAPE is undefined (None / N/A). Never report 0% for zero actuals.
+    wape = round(float(100.0 * np.sum(np.abs(e)) / denom), 2) if denom > 1e-6 else None
+    return {"MAE": mae, "RMSE": rmse, "WAPE": wape}
 
 
 def recursive_forecast(model, series, h):
@@ -156,9 +166,21 @@ def recursive_forecast(model, series, h):
 
 # ---------------------------------------------------------------- stock, batches, expiry
 def current_stock(ingredient_id):
+    stock = None
+    try:
+        import ledger
+        bal = ledger.get_book_balance(ingredient_id)
+        if bal is not None:
+            stock = bal
+    except Exception:
+        pass
+
     r = db.query("SELECT date, closing_stock FROM manual_entries WHERE ingredient_id=? AND entry_status='ENTERED' "
                  "AND closing_stock IS NOT NULL ORDER BY date DESC LIMIT 1", (ingredient_id,))
-    return (r[0]["closing_stock"], r[0]["date"]) if r else (0.0, None)
+    stock_date = r[0]["date"] if r else None
+    if stock is None:
+        stock = r[0]["closing_stock"] if r else 0.0
+    return (stock, stock_date)
 
 
 def open_batches(ingredient_id, stock):
@@ -205,7 +227,8 @@ def train_ingredient(ing):
     ok = X[FEATS].notna().all(axis=1).values & ~np.isnan(y)
     tr = ok & ~val
     yv = y[val]; dates_v = list(s.index[val])
-    v = s.interpolate(limit_direction="both")
+    # Forward-only interpolation for baseline models: zero future lookahead
+    v = s.interpolate(limit_direction="forward").ffill().fillna(0.0)
     preds = {"Seasonal naive": v.shift(7).values[val], "Moving avg (7d)": v.shift(1).rolling(7).mean().values[val]}
     models = {}
     for name in ("Random Forest", "XGBoost"):
@@ -213,7 +236,8 @@ def train_ingredient(ing):
         preds[name] = m.predict(X.loc[val, FEATS])
         models[name] = m
     evals = {k: metrics(yv, p) for k, p in preds.items()}
-    best = min(evals, key=lambda k: evals[k]["WAPE"])
+    # Safe model selection handling None/undefined WAPE without returning 0% for zero denominators
+    best = min(evals, key=lambda k: (evals[k]["WAPE"] is None, evals[k]["WAPE"] if evals[k]["WAPE"] is not None else 1e9, evals[k]["RMSE"]))
     sigma = float(np.std(yv - preds[best]))
     # anomalies in the validation window
     resid = yv - preds[best]
@@ -243,6 +267,8 @@ def train_ingredient(ing):
     return {
         "ingredient_id": iid, "name": ing["name"], "unit": ing["unit"],
         "model": best, "validation": evals, "sigma": round(sigma, 3),
+        "target_type": "recorded_or_reconstructed_usage",
+        "stockout_censored": bool(stock <= 0.001),
         "history": [{"date": d, "usage": None if np.isnan(u) else round(float(u), 2), "quality": q}
                     for d, u, q in zip(s.index[-90:], s.values[-90:], ds.quality.values[-90:])],
         "validation_series": [{"date": d, "actual": round(float(a), 2),

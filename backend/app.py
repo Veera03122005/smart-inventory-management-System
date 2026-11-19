@@ -6,13 +6,28 @@ from flask import Flask, jsonify, request, Response, send_from_directory
 from flask_cors import CORS
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from werkzeug.security import check_password_hash, generate_password_hash
-import db, iot, ml, simulator
+import db, iot, ledger, ml, simulator
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(HERE, "..", "frontend", "dist")
 app = Flask(__name__, static_folder=None)
-CORS(app)
-SECRET = os.environ.get("SMARTSTOCK_SECRET", "change-me-in-production")
+
+# Production security: restrict CORS origins
+ENV = os.environ.get("SMARTSTOCK_ENV", "development").lower()
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("SMARTSTOCK_CORS_ORIGINS", "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173").split(",") if o.strip()]
+CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
+
+# Production security: fail startup if secret is missing or insecure in production mode
+SECRET = os.environ.get("SMARTSTOCK_SECRET")
+if ENV == "production":
+    if not SECRET or SECRET == "change-me-in-production" or len(SECRET) < 32:
+        raise RuntimeError(
+            "FATAL CONFIGURATION ERROR: In production mode (SMARTSTOCK_ENV=production), "
+            "SMARTSTOCK_SECRET must be explicitly set to a cryptographically secure key of at least 32 characters."
+        )
+else:
+    SECRET = SECRET or "change-me-in-production-dev-only"
+
 signer = URLSafeTimedSerializer(SECRET)
 TOKEN_HOURS = 12
 
@@ -22,14 +37,30 @@ def auth(*roles):
     def deco(fn):
         @wraps(fn)
         def wrapper(*a, **k):
-            tok = request.headers.get("Authorization", "").replace("Bearer ", "") or request.args.get("token", "")
+            # Security Hardening: tokens in URL query strings are explicitly prohibited
+            if not request.headers.get("Authorization") and request.args.get("token"):
+                return jsonify(error="Query string token authentication is disabled. Provide token via Authorization Bearer header."), 401
+
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                return jsonify(error="not authenticated"), 401
+
+            tok = auth_header[7:].strip()
             try:
-                user = signer.loads(tok, max_age=TOKEN_HOURS * 3600)
+                payload = signer.loads(tok, max_age=TOKEN_HOURS * 3600)
             except (BadSignature, SignatureExpired):
                 return jsonify(error="not authenticated"), 401
+
+            # Active user verification: revalidate user existence and current role from DB
+            u = db.query("SELECT id, username, role, full_name FROM users WHERE username=?", (payload.get("username", ""),))
+            if not u:
+                return jsonify(error="user no longer exists or has been deactivated"), 401
+
+            user = u[0]
             if roles and user["role"] not in roles:
                 return jsonify(error="not authorised for this action"), 403
-            request.user = user
+
+            request.user = {"username": user["username"], "role": user["role"], "full_name": user["full_name"]}
             return fn(*a, **k)
         return wrapper
     return deco
@@ -251,20 +282,142 @@ def manual_save():
         if p["entry_status"] == "MISSED": gap += 1
         else: break
     batch = b.get("batch_no") or (f"{ing}-M{date.replace('-', '')}" if received > 0 else None)
+    ref_id = f"MANUAL:{date}:{ing}"
+    idemp_base = b.get("idempotency_key") or f"MANUAL_{date}_{ing}"
+    user_name = request.user["username"]
+
     with db.tx() as con:
-        con.execute("INSERT INTO manual_entries(date,ingredient_id,opening_stock,received_qty,batch_no,expiry_date,used_qty,"
-                    "wastage_qty,wastage_reason,closing_stock,days_covered,entered_by,entry_status) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'ENTERED') ON CONFLICT(date,ingredient_id) DO UPDATE SET "
-                    "opening_stock=excluded.opening_stock, received_qty=excluded.received_qty, batch_no=excluded.batch_no,"
-                    "expiry_date=excluded.expiry_date, used_qty=excluded.used_qty, wastage_qty=excluded.wastage_qty,"
-                    "wastage_reason=excluded.wastage_reason, closing_stock=excluded.closing_stock,"
-                    "days_covered=excluded.days_covered, entered_by=excluded.entered_by, entry_status='ENTERED'",
-                    (date, ing, opening, received, batch, b.get("expiry_date") or None, used, waste,
-                     b.get("wastage_reason") or None, round(closing, 2), gap + 1, request.user["username"]))
-        con.execute("INSERT INTO audit_log(ts,actor,action,detail) VALUES (?,?,?,?)",
-                    (iot.now_str(), request.user["username"], "MANUAL_ENTRY", f"{date} {ing} used={used} closing={closing}"))
+        # Check if an entry already exists for this (date, ing) to detect duplicates vs corrections
+        prev_entry = con.execute(
+            "SELECT * FROM manual_entries WHERE date=? AND ingredient_id=?", (date, ing)
+        ).fetchone()
+
+        if prev_entry is not None:
+            prev_open = float(prev_entry["opening_stock"]) if prev_entry["opening_stock"] is not None else 0.0
+            prev_rec = float(prev_entry["received_qty"]) if prev_entry["received_qty"] is not None else 0.0
+            prev_used = float(prev_entry["used_qty"]) if prev_entry["used_qty"] is not None else 0.0
+            prev_waste = float(prev_entry["wastage_qty"]) if prev_entry["wastage_qty"] is not None else 0.0
+            prev_batch = str(prev_entry["batch_no"] or "")
+            prev_expiry = str(prev_entry["expiry_date"] or "")
+
+            is_identical = (
+                abs(prev_open - opening) < 1e-4 and
+                abs(prev_rec - received) < 1e-4 and
+                abs(prev_used - used) < 1e-4 and
+                abs(prev_waste - waste) < 1e-4 and
+                prev_batch == str(batch or "") and
+                prev_expiry == str(b.get("expiry_date") or "")
+            )
+            if is_identical:
+                # Idempotent retry: return existing saved status without generating secondary ledger rows or reversals
+                return jsonify(status="saved", closing_stock=round(closing, 2), days_covered=gap + 1, duplicate=True), 200
+
+            # Active correction: locate and reverse only currently active, unreversed transactions for this entry
+            unreversed_txs = con.execute(
+                """
+                SELECT t.transaction_id FROM inventory_transactions t
+                WHERE t.reference_id = ?
+                  AND t.transaction_type != 'REVERSAL'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM inventory_transactions r
+                      WHERE r.reversal_ref_id = t.transaction_id
+                  )
+                """,
+                (ref_id,)
+            ).fetchall()
+            for ptx in unreversed_txs:
+                try:
+                    ledger.reverse_transaction(
+                        original_tx_id=ptx[0],
+                        actor=user_name,
+                        reason=f"Corrected daily stock sheet for {date}",
+                        con=con
+                    )
+                except ValueError:
+                    pass
+
+            # Determine revision count so replacement movements receive unique idempotency keys
+            rev_count = con.execute(
+                "SELECT COUNT(*) FROM inventory_transactions WHERE reference_id=? AND transaction_type='REVERSAL'",
+                (ref_id,)
+            ).fetchone()[0]
+            if not b.get("idempotency_key"):
+                idemp_base = f"MANUAL_{date}_{ing}_rev{rev_count}"
+            else:
+                idemp_base = f"{b['idempotency_key']}_rev{rev_count}"
+
+        # Post new transactions to the immutable journal
+        if received > 0:
+            ledger.post_transaction(
+                ingredient_id=ing, transaction_type="STOCK_IN", quantity=received, delta_qty=+received,
+                unit="kg", actor=user_name, source_channel="MANUAL_FORM", reference_id=ref_id,
+                batch_no=batch, expiry_date=b.get("expiry_date"), idempotency_key=f"{idemp_base}_IN",
+                notes=f"Stock receipt on {date}", allow_negative=True, con=con
+            )
+        if used > 0:
+            ledger.post_transaction(
+                ingredient_id=ing, transaction_type="CONSUMPTION", quantity=used, delta_qty=-used,
+                unit="kg", actor=user_name, source_channel="MANUAL_FORM", reference_id=ref_id,
+                idempotency_key=f"{idemp_base}_USE", notes=f"Daily kitchen usage on {date}",
+                allow_negative=True, con=con
+            )
+        if waste > 0:
+            ledger.post_transaction(
+                ingredient_id=ing, transaction_type="WASTAGE", quantity=waste, delta_qty=-waste,
+                unit="kg", actor=user_name, source_channel="MANUAL_FORM", reference_id=ref_id,
+                idempotency_key=f"{idemp_base}_WASTE", notes=b.get("wastage_reason") or f"Kitchen wastage on {date}",
+                allow_negative=True, con=con
+            )
+
+        # Update manual_entries table for full backward compatibility
+        con.execute(
+            "INSERT INTO manual_entries(date,ingredient_id,opening_stock,received_qty,batch_no,expiry_date,used_qty,"
+            "wastage_qty,wastage_reason,closing_stock,days_covered,entered_by,entry_status) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'ENTERED') ON CONFLICT(date,ingredient_id) DO UPDATE SET "
+            "opening_stock=excluded.opening_stock, received_qty=excluded.received_qty, batch_no=excluded.batch_no,"
+            "expiry_date=excluded.expiry_date, used_qty=excluded.used_qty, wastage_qty=excluded.wastage_qty,"
+            "wastage_reason=excluded.wastage_reason, closing_stock=excluded.closing_stock,"
+            "days_covered=excluded.days_covered, entered_by=excluded.entered_by, entry_status='ENTERED'",
+            (date, ing, opening, received, batch, b.get("expiry_date") or None, used, waste,
+             b.get("wastage_reason") or None, round(closing, 2), gap + 1, user_name)
+        )
+        con.execute(
+            "INSERT INTO audit_log(ts,actor,action,detail) VALUES (?,?,?,?)",
+            (iot.now_str(), user_name, "MANUAL_ENTRY", f"{date} {ing} used={used} closing={closing}")
+        )
+
     ml.invalidate()
     return jsonify(status="saved", closing_stock=round(closing, 2), days_covered=gap + 1), 201
+
+
+# ------------------------------------------------------------------ inventory journal endpoints
+@app.get("/api/inventory/transactions")
+@auth("owner", "manager")
+def inventory_transactions():
+    ing = request.args.get("ingredient_id")
+    limit = int(request.args.get("limit", 100))
+    sql = "SELECT * FROM inventory_transactions"
+    args = []
+    if ing:
+        sql += " WHERE ingredient_id=?"
+        args.append(ing)
+    sql += " ORDER BY timestamp DESC, created_at DESC LIMIT ?"
+    args.append(limit)
+    return jsonify(db.query(sql, args))
+
+
+@app.get("/api/inventory/reconciliation")
+@auth("owner", "manager")
+def inventory_reconciliation():
+    ing = request.args.get("ingredient_id")
+    return jsonify(ledger.reconcile_balances(ingredient_id=ing))
+
+
+@app.post("/api/inventory/reconciliation/fix")
+@auth("owner")
+def inventory_reconciliation_fix():
+    ing = (request.get_json(force=True, silent=True) or {}).get("ingredient_id")
+    return jsonify(ledger.reconcile_balances(ingredient_id=ing, fix=True, actor=request.user["username"]))
 
 
 # ------------------------------------------------------------------ IoT

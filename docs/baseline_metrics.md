@@ -2,8 +2,8 @@
 
 > **Research Paper Baseline**: Pre-intervention performance snapshot evaluated on the shipped 60-day validation window.
 
-- **Generated At**: 2026-11-18T23:42:36
-- **Training Duration**: 16.1 seconds
+- **Generated At**: 2026-11-19T10:04:16
+- **Training Duration**: 8.8 seconds
 - **Validation Horizon**: 60 days (time-based split)
 - **Forecast Horizon**: 7 days
 - **Cycle Service Level**: 98% (Z = 2.05)
