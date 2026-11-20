@@ -47,15 +47,19 @@ def test_06_me_endpoint_missing_token(client):
 # 2. RBAC (ROLE-BASED ACCESS CONTROL) TESTS
 # -------------------------------------------------------------
 def test_07_rbac_users_endpoint(client, login):
-    # Staff -> 403
+    # Staff -> 403 Forbidden
     res_staff = client.get("/api/users", headers=login("staff"))
     assert res_staff.status_code == 403
 
-    # Manager -> 403
+    # Manager -> 200 OK (access to staff account management)
     res_mgr = client.get("/api/users", headers=login("manager"))
-    assert res_mgr.status_code == 403
+    assert res_mgr.status_code == 200
+    mgr_users = res_mgr.get_json()
+    assert isinstance(mgr_users, list)
+    # Manager only sees staff accounts
+    assert all(u["role"] == "staff" for u in mgr_users)
 
-    # Owner -> 200
+    # Owner -> 200 OK (access to all user accounts)
     res_owner = client.get("/api/users", headers=login("owner"))
     assert res_owner.status_code == 200
     assert isinstance(res_owner.get_json(), list)

@@ -82,6 +82,14 @@ def run_migrations(con=None):
                     con.execute("ROLLBACK")
                 except Exception:
                     pass
+                if "duplicate column name" in str(e).lower():
+                    con.execute(
+                        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                        (version, name, now_str)
+                    )
+                    con.commit()
+                    newly_applied.append(name)
+                    continue
                 raise RuntimeError(f"Database migration '{name}' (v{version}) failed: {e}") from e
 
         return newly_applied

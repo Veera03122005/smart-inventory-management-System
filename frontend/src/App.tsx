@@ -11,6 +11,7 @@ import Forecast from "./pages/Forecast";
 import Alerts from "./pages/Alerts";
 import Reports from "./pages/Reports";
 import Users from "./pages/Users";
+import DepletionInvestigation from "./pages/DepletionInvestigation";
 
 interface NavItem {
   to: string;
@@ -61,6 +62,16 @@ const NAV: NavItem[] = [
     ),
   },
   {
+    to: "/investigations",
+    label: "Depletion Investigation",
+    roles: ["owner", "manager"],
+    icon: (a) => (
+      <svg className={`w-5 h-5 shrink-0 ${a ? "text-emerald-400" : "text-white/60"}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v3m0 0v3m0-3h3m-3 0H7" />
+      </svg>
+    ),
+  },
+  {
     to: "/forecast",
     label: "AI Forecast",
     roles: ["owner", "manager"],
@@ -93,7 +104,7 @@ const NAV: NavItem[] = [
   {
     to: "/users",
     label: "Users & Roles",
-    roles: ["owner"],
+    roles: ["owner", "manager"],
     icon: (a) => (
       <svg className={`w-5 h-5 shrink-0 ${a ? "text-emerald-400" : "text-white/60"}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75} d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
@@ -212,7 +223,7 @@ export default function App() {
                 {({ isActive }) => (
                   <>
                     {n.icon(isActive)}
-                    <span>{n.label}</span>
+                    <span>{n.to === "/users" && user.role === "manager" ? "Staff Accounts" : n.label}</span>
                   </>
                 )}
               </NavLink>
@@ -252,6 +263,7 @@ export default function App() {
           <Route path="/refill" element={<Refill />} />
           <Route path="/stock-sheet" element={<StockSheet />} />
           <Route path="/alerts" element={<Alerts />} />
+          {can("/investigations") && <Route path="/investigations" element={<DepletionInvestigation />} />}
           {can("/forecast") && <Route path="/forecast" element={<Forecast />} />}
           {can("/reports") && <Route path="/reports" element={<Reports />} />}
           {can("/users") && <Route path="/users" element={<Users />} />}

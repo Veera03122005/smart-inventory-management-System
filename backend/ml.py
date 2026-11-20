@@ -99,13 +99,21 @@ def manual_daily_usage(ingredient_id, cutoff_date=None):
 
 def daily_series(ingredient_id, cutoff_date=None):
     """Merged daily series: IoT where a full sensor day exists, else manual register."""
-    m = manual_daily_usage(ingredient_id, cutoff_date=cutoff_date).set_index("date")
-    s = m.usage.copy(); q = m.quality.copy()
+    m = manual_daily_usage(ingredient_id, cutoff_date=cutoff_date)
+    if not m.empty:
+        m = m.set_index("date")
+        s = m.usage.copy(); q = m.quality.copy()
+    else:
+        s = pd.Series(dtype=float); q = pd.Series(dtype=str)
     iot = iot_daily_usage(ingredient_id)
     if not iot.empty:
         full = iot[iot.readings >= 150]                 # >= ~80 % of the day's 5-min readings
         for r in full.itertuples():
             s.loc[r.date] = r.usage; q.loc[r.date] = "iot"
+    if s.empty:
+        today = datetime.now().strftime("%Y-%m-%d")
+        idx = pd.date_range(end=today, periods=14, freq="D").strftime("%Y-%m-%d")
+        return pd.DataFrame({"usage": pd.Series(0.0, index=idx), "quality": pd.Series("missing", index=idx)})
     s = s.sort_index(); q = q.reindex(s.index)
     idx = pd.date_range(s.index.min(), s.index.max(), freq="D").strftime("%Y-%m-%d")
     s = s.reindex(idx); q = q.reindex(idx).fillna("missing")
@@ -142,6 +150,10 @@ def make_model(name, seed=42):
 
 def metrics(y, p):
     y, p = np.asarray(y, float), np.asarray(p, float)
+    mask = ~np.isnan(y) & ~np.isnan(p)
+    if not np.any(mask):
+        return {"MAE": 0.0, "RMSE": 0.0, "WAPE": None}
+    y, p = y[mask], p[mask]
     e = p - y
     denom = float(np.sum(y))
     mae = round(float(np.mean(np.abs(e))), 3)
@@ -158,7 +170,11 @@ def recursive_forecast(model, series, h):
         nxt = (pd.Timestamp(s.index[-1]) + timedelta(days=1)).strftime("%Y-%m-%d")
         s.loc[nxt] = np.nan
         X = features(s).iloc[[-1]][FEATS]
-        p = max(0.0, float(model.predict(X)[0]))
+        try:
+            raw_p = model.predict(X)[0]
+            p = max(0.0, float(raw_p)) if np.isfinite(raw_p) else 0.0
+        except Exception:
+            p = 0.0
         s.loc[nxt] = p
         out.append((nxt, p))
     return out
@@ -229,30 +245,41 @@ def train_ingredient(ing):
     yv = y[val]; dates_v = list(s.index[val])
     # Forward-only interpolation for baseline models: zero future lookahead
     v = s.interpolate(limit_direction="forward").ffill().fillna(0.0)
-    preds = {"Seasonal naive": v.shift(7).values[val], "Moving avg (7d)": v.shift(1).rolling(7).mean().values[val]}
+    naive = v.shift(7).values[val] if len(v) >= 7 else np.zeros(val.sum())
+    ma7 = v.shift(1).rolling(7, min_periods=1).mean().values[val]
+    preds = {"Seasonal naive": np.nan_to_num(naive, nan=0.0), "Moving avg (7d)": np.nan_to_num(ma7, nan=0.0)}
     models = {}
+    can_train_ml = int(tr.sum()) >= 5
     for name in ("Random Forest", "XGBoost"):
-        m = make_model(name).fit(X.loc[tr, FEATS], y[tr])
-        preds[name] = m.predict(X.loc[val, FEATS])
-        models[name] = m
+        if can_train_ml:
+            m = make_model(name).fit(X.loc[tr, FEATS], y[tr])
+            preds[name] = m.predict(X.loc[val, FEATS])
+            models[name] = m
+        else:
+            preds[name] = preds["Moving avg (7d)"]
     evals = {k: metrics(yv, p) for k, p in preds.items()}
     # Safe model selection handling None/undefined WAPE without returning 0% for zero denominators
     best = min(evals, key=lambda k: (evals[k]["WAPE"] is None, evals[k]["WAPE"] if evals[k]["WAPE"] is not None else 1e9, evals[k]["RMSE"]))
-    sigma = float(np.std(yv - preds[best]))
+    valid_res = (yv - preds[best])[~np.isnan(yv - preds[best])]
+    sigma = float(np.std(valid_res)) if len(valid_res) > 0 else 0.0
+    if np.isnan(sigma) or not np.isfinite(sigma):
+        sigma = 0.0
     # anomalies in the validation window
     resid = yv - preds[best]
     anomalies = [{"date": d, "actual": round(float(a), 2), "expected": round(float(p), 2),
-                  "z": round(float(r / sigma), 2)} for d, a, p, r in zip(dates_v, yv, preds[best], resid)
-                 if sigma > 0 and abs(r) > 3 * sigma]
+                  "z": round(float(r / sigma), 2) if sigma > 0 else 0.0} for d, a, p, r in zip(dates_v, yv, preds[best], resid)
+                 if not np.isnan(a) and not np.isnan(r) and sigma > 0 and abs(r) > 3 * sigma]
     # refit on all data and forecast
-    if best in ("Random Forest", "XGBoost"):
+    if best in ("Random Forest", "XGBoost") and int(ok.sum()) >= 5:
         final = make_model(best).fit(X.loc[ok, FEATS], y[ok])
         fc = recursive_forecast(final, s, HORIZON)
-    elif best == "Seasonal naive":
+    elif best == "Seasonal naive" and len(v) >= 7:
         fc = [((pd.Timestamp(s.index[-1]) + timedelta(days=k + 1)).strftime("%Y-%m-%d"), float(v.iloc[-7 + k % 7]))
               for k in range(HORIZON)]
     else:
-        m7 = float(v.iloc[-7:].mean())
+        m7 = float(v.iloc[-7:].mean()) if len(v) > 0 else 0.0
+        if np.isnan(m7) or not np.isfinite(m7):
+            m7 = 0.0
         fc = [((pd.Timestamp(s.index[-1]) + timedelta(days=k + 1)).strftime("%Y-%m-%d"), m7) for k in range(HORIZON)]
     stock, stock_date = current_stock(iid)
     L = int(ing["lead_time_days"]); perish = ing["shelf_life_days"] <= 5
@@ -260,8 +287,13 @@ def train_ingredient(ing):
     s_pt = sum(p for _, p in fc[:L]) + Z * sigma * np.sqrt(L)
     S_pt = sum(p for _, p in fc[:H]) + Z * sigma * np.sqrt(H) if H <= HORIZON else \
         sum(p for _, p in fc) * H / HORIZON + Z * sigma * np.sqrt(H)
+    s_pt = float(s_pt) if np.isfinite(s_pt) else 0.0
+    S_pt = float(S_pt) if np.isfinite(S_pt) else 0.0
     order_qty = max(0.0, S_pt - stock) if (perish or stock < s_pt) else 0.0
-    avg_fc = np.mean([p for _, p in fc])
+    order_qty = float(order_qty) if np.isfinite(order_qty) else 0.0
+    avg_fc = float(np.mean([p for _, p in fc])) if fc else 0.0
+    if np.isnan(avg_fc) or not np.isfinite(avg_fc):
+        avg_fc = 0.0
     batches = open_batches(iid, stock)
     risk = expiry_risk(batches, fc, fc[0][0])
     return {
@@ -271,13 +303,13 @@ def train_ingredient(ing):
         "stockout_censored": bool(stock <= 0.001),
         "history": [{"date": d, "usage": None if np.isnan(u) else round(float(u), 2), "quality": q}
                     for d, u, q in zip(s.index[-90:], s.values[-90:], ds.quality.values[-90:])],
-        "validation_series": [{"date": d, "actual": round(float(a), 2),
-                               **{k: round(float(p[i]), 2) for k, p in preds.items()}}
+        "validation_series": [{"date": d, "actual": None if np.isnan(a) else round(float(a), 2),
+                               **{k: None if np.isnan(p[i]) else round(float(p[i]), 2) for k, p in preds.items()}}
                               for i, (d, a) in enumerate(zip(dates_v, yv))],
         "forecast": [{"date": d, "qty": round(p, 2), "low": round(max(0, p - Z * sigma), 2),
                       "high": round(p + Z * sigma, 2)} for d, p in fc],
         "target_date": fc[0][0], "prep_qty": round(fc[0][1], 2),
-        "stock": stock, "stock_date": stock_date, "days_of_cover": round(stock / avg_fc, 2) if avg_fc else None,
+        "stock": stock, "stock_date": stock_date, "days_of_cover": round(stock / avg_fc, 2) if avg_fc > 1e-6 and np.isfinite(stock / avg_fc) else None,
         "reorder_point": round(s_pt, 2), "order_up_to": round(S_pt, 2), "order_qty": round(order_qty, 2),
         "perishable": bool(perish), "batches": risk, "anomalies": anomalies,
         "data_quality": ds.quality.value_counts().to_dict(),

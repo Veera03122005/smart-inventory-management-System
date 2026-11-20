@@ -8,3 +8,5 @@ backend/backups/
 backend/model_cache.json
 backend/server.log
 .venv/
+backend/uploads/
+scratch/
