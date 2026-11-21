@@ -2,9 +2,11 @@ import { useState, useId } from "react";
 import { Link } from "react-router-dom";
 import { Area, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api, fmt, rupees, shortDate } from "../api";
+import { useAuth, isStaff, isManager, isOwner } from "../auth";
 import { Badge, ErrorNote, Page, Stat, SkeletonCard, SkeletonTable, useData } from "../ui";
 
 export default function Dashboard() {
+  const { user } = useAuth();
   const { data, error, loading } = useData(() => api("/dashboard"), 15000);
   const fc = useData(() => api("/forecast"), 60000);
   const [sel, setSel] = useState("ING01");
@@ -17,7 +19,7 @@ export default function Dashboard() {
     );
   }
 
-  if (loading || !data) {
+  if (loading || !data || !data.cards) {
     return (
       <Page title="Kitchen Overview" sub="Loading live kitchen inventory intelligence…">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
@@ -39,8 +41,8 @@ export default function Dashboard() {
   }
 
   const c = data.cards;
-  const r = fc.data?.results.find((x: any) => x.ingredient_id === sel);
-  const series = r
+  const r = (fc.data?.results || []).find((x: any) => x.ingredient_id === sel);
+  const series = r && Array.isArray(r.history) && Array.isArray(r.forecast)
     ? [
         ...r.history.slice(-30).map((h: any) => ({ date: h.date, actual: h.usage })),
         ...r.forecast.map((f: any) => ({ date: f.date, forecast: f.qty, band: [f.low, f.high] })),
@@ -76,48 +78,143 @@ export default function Dashboard() {
     >
       {/* ----------------- KPI Cards Grid ----------------- */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <Stat
-          label="Total Stock Value"
-          value={rupees(c.stock_value_rs)}
-          hint={`${c.ingredients} tracked pantry items`}
-          icon={
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-            </svg>
-          }
-        />
-        <Stat
-          label="To Order Today"
-          value={rupees(c.order_value_rs)}
-          hint={`${c.low_stock} item(s) below reorder safety`}
-          tone={c.low_stock > 0 ? "warn" : undefined}
-          icon={
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" />
-            </svg>
-          }
-        />
-        <Stat
-          label="Open Alerts"
-          value={c.open_alerts}
-          hint={`${c.expiry_risk} batch(es) at risk of expiry`}
-          tone={c.open_alerts > 0 ? "bad" : "good"}
-          icon={
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
-            </svg>
-          }
-        />
-        <Stat
-          label="Wastage (Last 7 Days)"
-          value={rupees(c.wastage_7d_rs)}
-          hint={`${fmt((100 * c.wastage_7d_rs) / Math.max(1, c.usage_7d_rs), 2)}% of total usage value`}
-          icon={
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-            </svg>
-          }
-        />
+        {isStaff(user) ? (
+          <>
+            <Stat
+              label="Tracked Pantry Items"
+              value={c.ingredients}
+              hint="Active kitchen inventory items"
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
+                </svg>
+              }
+            />
+            <Stat
+              label="Items to Reorder"
+              value={c.low_stock}
+              hint={c.low_stock > 0 ? "Stock is below safety threshold" : "All items sufficiently stocked"}
+              tone={c.low_stock > 0 ? "warn" : "good"}
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" />
+                </svg>
+              }
+            />
+            <Stat
+              label="Open Kitchen Alerts"
+              value={c.open_alerts}
+              hint={`${c.expiry_risk} batch(es) at risk of expiry`}
+              tone={c.open_alerts > 0 ? "bad" : "good"}
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                </svg>
+              }
+            />
+            <Stat
+              label="Batches Expiring Soon"
+              value={c.expiry_risk}
+              hint={c.expiry_risk > 0 ? "Prioritize using these batches first" : "No batches at immediate risk"}
+              tone={c.expiry_risk > 0 ? "warn" : "good"}
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              }
+            />
+          </>
+        ) : isManager(user) ? (
+          <>
+            <Stat
+              label="Today's Food Sales"
+              value={c.sales_today_rs != null ? rupees(c.sales_today_rs) : "Data Unavailable"}
+              hint={c.sales_today_rs != null ? "Daily restaurant food orders" : "Sales integration not configured"}
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              }
+            />
+            <Stat
+              label="7-Day Food Sales"
+              value={c.sales_7d_rs != null ? rupees(c.sales_7d_rs) : "Data Unavailable"}
+              hint={c.sales_7d_rs != null ? "Weekly gross restaurant volume" : "Sales integration not configured"}
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+                </svg>
+              }
+            />
+            <Stat
+              label="Open Alerts"
+              value={c.open_alerts}
+              hint={`${c.expiry_risk} batch(es) at risk of expiry`}
+              tone={c.open_alerts > 0 ? "bad" : "good"}
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                </svg>
+              }
+            />
+            <Stat
+              label="Items to Reorder"
+              value={c.low_stock}
+              hint={`${c.low_stock} item(s) below reorder safety`}
+              tone={c.low_stock > 0 ? "warn" : undefined}
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" />
+                </svg>
+              }
+            />
+          </>
+        ) : (
+          <>
+            <Stat
+              label="Total Stock Value"
+              value={rupees(c.stock_value_rs)}
+              hint={`${c.ingredients} tracked pantry items`}
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
+                </svg>
+              }
+            />
+            <Stat
+              label="To Order Today"
+              value={rupees(c.order_value_rs)}
+              hint={`${c.low_stock} item(s) below reorder safety`}
+              tone={c.low_stock > 0 ? "warn" : undefined}
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" />
+                </svg>
+              }
+            />
+            <Stat
+              label="Open Alerts"
+              value={c.open_alerts}
+              hint={`${c.expiry_risk} batch(es) at risk of expiry`}
+              tone={c.open_alerts > 0 ? "bad" : "good"}
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                </svg>
+              }
+            />
+            <Stat
+              label="Wastage (Last 7 Days)"
+              value={rupees(c.wastage_7d_rs)}
+              hint={`${fmt((100 * c.wastage_7d_rs) / Math.max(1, c.usage_7d_rs), 2)}% of total usage value`}
+              icon={
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+              }
+            />
+          </>
+        )}
       </div>
 
       {/* ----------------- Main Content Grid ----------------- */}

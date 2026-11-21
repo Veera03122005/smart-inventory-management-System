@@ -2,7 +2,11 @@ import { createContext, useContext, useEffect, useState, ReactNode } from "react
 import { api, clearToken, getToken, setToken } from "./api";
 
 export type Role = "owner" | "manager" | "staff";
-export type User = { username: string; role: Role; full_name: string };
+export type User = { username: string; role: Role; full_name: string; is_active?: number };
+
+export const isStaff = (u?: User | null): boolean => u?.role === "staff";
+export const isManager = (u?: User | null): boolean => u?.role === "manager";
+export const isOwner = (u?: User | null): boolean => u?.role === "owner";
 type Ctx = { user: User | null; loading: boolean; login: (u: string, p: string) => Promise<void>; logout: () => void };
 const AuthCtx = createContext<Ctx>(null as unknown as Ctx);
 export const useAuth = () => useContext(AuthCtx);

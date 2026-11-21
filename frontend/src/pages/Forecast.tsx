@@ -20,7 +20,7 @@ export default function Forecast() {
 
   if (!data) return <Loading label="Loading ML models & validation series…" />;
 
-  const r = data.results.find((x: any) => x.ingredient_id === sel);
+  const r = (data?.results || []).find((x: any) => x.ingredient_id === sel);
 
   const retrain = async () => {
     setBusy(true);

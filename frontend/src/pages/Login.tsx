@@ -156,33 +156,35 @@ export default function Login() {
             {busy ? "Signing in…" : "Sign In to Kitchen"}
           </button>
 
-          {/* Quick Demo Access - Click any to auto-fill username & password */}
-          <div className="pt-4 border-t border-surface-border">
-            <span className="label">1-Click Demo Accounts</span>
-            <div className="grid grid-cols-3 gap-2 mt-2">
-              {DEMO.map((d) => (
-                <button
-                  type="button"
-                  key={d.role}
-                  className={`btn-ghost text-xs py-2 px-1 flex flex-col items-center gap-0.5 transition-all ${
-                    u === d.role ? "border-brand-500 bg-brand-50 text-brand-800 shadow-sm" : ""
-                  }`}
-                  onClick={() => {
-                    setU(d.role);
-                    setP(d.pass);
-                    setErr("");
-                  }}
-                  title={`Log in as ${d.role} (password: ${d.pass})`}
-                >
-                  <span className="font-bold capitalize">{d.role}</span>
-                  <span className="text-[10px] text-content-muted leading-tight text-center">{d.desc}</span>
-                </button>
-              ))}
+          {/* Quick Demo Access - Gated strictly behind development / explicit environment flag */}
+          {(import.meta.env.DEV || import.meta.env.VITE_ENABLE_DEMO_LOGIN === "true") && (
+            <div className="pt-4 border-t border-surface-border">
+              <span className="label">1-Click Demo Accounts (Dev Only)</span>
+              <div className="grid grid-cols-3 gap-2 mt-2">
+                {DEMO.map((d) => (
+                  <button
+                    type="button"
+                    key={d.role}
+                    className={`btn-ghost text-xs py-2 px-1 flex flex-col items-center gap-0.5 transition-all ${
+                      u === d.role ? "border-brand-500 bg-brand-50 text-brand-800 shadow-sm" : ""
+                    }`}
+                    onClick={() => {
+                      setU(d.role);
+                      setP(d.pass);
+                      setErr("");
+                    }}
+                    title={`Log in as ${d.role} (password: ${d.pass})`}
+                  >
+                    <span className="font-bold capitalize">{d.role}</span>
+                    <span className="text-[10px] text-content-muted leading-tight text-center">{d.desc}</span>
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] text-content-muted text-center mt-2.5">
+                Default password for all roles is <code className="font-mono bg-slate-100 px-1 py-0.5 rounded text-content-primary font-semibold">&lt;role&gt;123</code> (e.g. <strong className="text-content-primary">owner123</strong>)
+              </p>
             </div>
-            <p className="text-[11px] text-content-muted text-center mt-2.5">
-              Default password for all roles is <code className="font-mono bg-slate-100 px-1 py-0.5 rounded text-content-primary font-semibold">&lt;role&gt;123</code> (e.g. <strong className="text-content-primary">owner123</strong>)
-            </p>
-          </div>
+          )}
         </form>
       </div>
     </div>

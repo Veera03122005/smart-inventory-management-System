@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL CHECK (role IN ('owner','manager','staff')),
-  full_name TEXT
+  full_name TEXT,
+  is_active INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS ingredients (
   ingredient_id TEXT PRIMARY KEY,
@@ -110,5 +111,11 @@ def query(sql, args=()):
 
 
 def init_schema():
-    with tx() as con:
-        con.executescript(SCHEMA)
+    """Authoritative schema initialization and migration runner."""
+    import migrations
+    migrations.run_migrations()
+
+
+def ensure_user_columns():
+    """Deprecated: Schema is authoritatively maintained by migrations runner (see 007_user_active_status.sql)."""
+    pass

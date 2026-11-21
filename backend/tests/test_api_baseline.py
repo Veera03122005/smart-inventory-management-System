@@ -2,6 +2,7 @@
 SmartStock AI - Baseline API and Regression Test Suite.
 Verifies Authentication, RBAC, Core Endpoints, Ledger & Refill Workflows, and Validation Errors.
 """
+from datetime import datetime, timedelta
 import time
 import pytest
 
@@ -46,15 +47,19 @@ def test_06_me_endpoint_missing_token(client):
 # 2. RBAC (ROLE-BASED ACCESS CONTROL) TESTS
 # -------------------------------------------------------------
 def test_07_rbac_users_endpoint(client, login):
-    # Staff -> 403
+    # Staff -> 403 Forbidden
     res_staff = client.get("/api/users", headers=login("staff"))
     assert res_staff.status_code == 403
 
-    # Manager -> 403
+    # Manager -> 200 OK (access to staff account management)
     res_mgr = client.get("/api/users", headers=login("manager"))
-    assert res_mgr.status_code == 403
+    assert res_mgr.status_code == 200
+    mgr_users = res_mgr.get_json()
+    assert isinstance(mgr_users, list)
+    # Manager only sees staff accounts
+    assert all(u["role"] == "staff" for u in mgr_users)
 
-    # Owner -> 200
+    # Owner -> 200 OK (access to all user accounts)
     res_owner = client.get("/api/users", headers=login("owner"))
     assert res_owner.status_code == 200
     assert isinstance(res_owner.get_json(), list)
@@ -208,8 +213,17 @@ def test_16_refill_session_lifecycle(client, login):
     assert open_res2.status_code == 201
     session2 = open_res2.get_json()
     sid2 = session2["session_id"]
+    base_w2 = session2["weight_before_kg"]
 
     # 4a. Attempting to complete with no weight added must be rejected with 422
+    keys = {"ESP32-RICE-01": "rice-key-123", "ESP32-OIL-01": "oil-key-123", "ESP32-ONION-01": "onion-key-123"}
+    device_key = keys.get(dev_id, "rice-key-123")
+    time.sleep(1.05)
+    seq0 = int(time.time() * 10) % 1000000
+    fresh_time0 = (datetime.now() + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+    client.post("/api/iot/readings", headers={"X-Device-Key": device_key}, json={
+        "device_id": dev_id, "weight_kg": base_w2, "seq_no": seq0, "stable": 1, "measured_at": fresh_time0
+    })
     comp_fail = client.post(f"/api/refill/{sid2}/complete", headers=login("staff"))
     assert comp_fail.status_code == 422
     assert "no valid refill detected" in comp_fail.get_json().get("error", "")
@@ -225,11 +239,12 @@ def test_16_refill_session_lifecycle(client, login):
     base_w = session3["weight_before_kg"]
 
     # Send reading from device showing weight increase (+3.0 kg)
-    keys = {"ESP32-RICE-01": "rice-key-123", "ESP32-OIL-01": "oil-key-123", "ESP32-ONION-01": "onion-key-123"}
-    device_key = keys.get(dev_id, "rice-key-123")
-    seq = int(time.time() * 100) % 1000000
+    seq = int(time.time() * 10 + 5) % 1000000
+    time.sleep(1.05)
+    fresh_time = (datetime.now() + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
     ingest_res = client.post("/api/iot/readings", headers={"X-Device-Key": device_key}, json={
-        "device_id": dev_id, "weight_kg": round(base_w + 3.0, 2), "seq_no": seq, "stable": 1
+        "device_id": dev_id, "weight_kg": round(base_w + 3.0, 2), "seq_no": seq, "stable": 1,
+        "measured_at": fresh_time
     })
     assert ingest_res.status_code in [200, 201]
 

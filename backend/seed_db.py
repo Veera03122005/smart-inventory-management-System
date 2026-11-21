@@ -53,6 +53,28 @@ def seed(fresh=False):
         last = iot.groupby("device_id").agg(ts=("timestamp", "max"), seq=("seq_no", "max"))
         for dev, r in last.iterrows():
             con.execute("UPDATE devices SET last_seen=?, last_seq=? WHERE device_id=?", (r.ts, int(r.seq), dev))
+
+        # Initialize inventory_balances and baseline inventory_transactions
+        for _, r in ing.iterrows():
+            iid = r.ingredient_id
+            last_entry = con.execute(
+                "SELECT closing_stock, date FROM manual_entries WHERE ingredient_id=? AND entry_status='ENTERED' "
+                "AND closing_stock IS NOT NULL ORDER BY date DESC LIMIT 1", (iid,)
+            ).fetchone()
+            stock = float(last_entry[0]) if last_entry and last_entry[0] is not None else 0.0
+            stock_date = last_entry[1] if last_entry else "2026-11-15"
+            tx_id = f"TX_INIT_{iid}"
+            con.execute(
+                "INSERT OR IGNORE INTO inventory_transactions (transaction_id, ingredient_id, quantity, delta_qty, "
+                "unit, transaction_type, source_channel, timestamp, actor, notes) "
+                "VALUES (?, ?, ?, ?, ?, 'STOCK_COUNT', 'BASELINE_MIGRATION', ?, 'system', 'Baseline stock count')",
+                (tx_id, iid, stock, stock, r.unit, f"{stock_date} 23:59:59")
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO inventory_balances (ingredient_id, book_balance, last_transaction_id, last_updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (iid, stock, tx_id, f"{stock_date} 23:59:59")
+            )
     print("Database ready:", db.DB_PATH)
 
 

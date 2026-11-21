@@ -4,6 +4,11 @@ import { ErrorNote, Page } from "../ui";
 
 const REPORTS = [
   {
+    id: "sales",
+    title: "Daily Food Sales & Order Volume",
+    desc: "Daily restaurant food sales revenue and customer order counts derived from kitchen dispatches.",
+  },
+  {
     id: "stock_summary",
     title: "Stock Balance Summary",
     desc: "Current on-hand inventory levels, calculated days of stock cover, and dynamic reorder points for every ingredient.",
