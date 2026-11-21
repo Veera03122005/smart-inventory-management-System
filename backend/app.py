@@ -316,58 +316,49 @@ def ack():
 
 # ------------------------------------------------------------------ dashboard & forecast
 def get_sales_metrics():
-    """Computes daily food sales figures and order volume from kitchen demand history."""
+    """
+    Retrieves authoritative sales data if recorded in the database.
+    Strictly does NOT fabricate sales metrics from ingredient usage, food costs, or fixed fallbacks.
+    Returns status 'DATA_UNAVAILABLE' if no actual sales stream exists in the database.
+    """
     try:
-        res = ml.get_results()["results"]
-        stock_date = next(iter(res.values()))["stock_date"]
+        tables = [r["name"] for r in db.query("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('daily_sales', 'sales_records')")]
+        if not tables:
+            return {"status": "DATA_UNAVAILABLE", "error": "DATA_UNAVAILABLE", "message": "Actual sales data is unavailable"}
+        tbl = tables[0]
+        rows = db.query(f"SELECT date, gross_sales_rs, orders_count FROM {tbl} ORDER BY date DESC LIMIT 30")
+        if not rows:
+            return {"status": "DATA_UNAVAILABLE", "error": "DATA_UNAVAILABLE", "message": "Actual sales data is unavailable"}
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_row = next((r for r in rows if r["date"] == today), rows[0])
+        sales_7d = sum(r["gross_sales_rs"] for r in rows[:7])
+        orders_7d = sum(r["orders_count"] for r in rows[:7])
+        return {
+            "status": "AVAILABLE",
+            "today_sales_rs": today_row["gross_sales_rs"],
+            "sales_7d_rs": sales_7d,
+            "orders_today": today_row["orders_count"],
+            "orders_7d": orders_7d,
+            "daily": [{"date": r["date"], "orders_count": r["orders_count"], "gross_sales_rs": r["gross_sales_rs"]} for r in rows]
+        }
     except Exception:
-        stock_date = datetime.now().strftime("%Y-%m-%d")
-
-    cost = {i["ingredient_id"]: i["unit_cost_rs"] for i in db.query("SELECT * FROM ingredients")}
-
-    # Standard food cost multiplier (~33% food cost target in restaurant operations)
-    day_usage = db.query("SELECT ingredient_id, SUM(used_qty) u FROM manual_entries WHERE date=? GROUP BY 1", (stock_date,))
-    today_cost = sum((x["u"] or 0) * cost.get(x["ingredient_id"], 100) for x in day_usage)
-    today_sales = round(today_cost * 3.0) if today_cost > 0 else 48500
-    today_orders = max(50, round(today_sales / 150))
-
-    week = (datetime.strptime(stock_date, "%Y-%m-%d") - timedelta(days=6)).strftime("%Y-%m-%d")
-    week_usage = db.query("SELECT date, ingredient_id, SUM(used_qty) u FROM manual_entries WHERE date>=? AND date<=? GROUP BY 1, 2", (week, stock_date))
-    week_cost = sum((x["u"] or 0) * cost.get(x["ingredient_id"], 100) for x in week_usage)
-    sales_7d = round(week_cost * 3.0) if week_cost > 0 else today_sales * 7
-    orders_7d = max(350, round(sales_7d / 150))
-
-    daily_totals = {}
-    for x in week_usage:
-        d = x["date"]
-        c_val = (x["u"] or 0) * cost.get(x["ingredient_id"], 100)
-        daily_totals[d] = daily_totals.get(d, 0) + c_val
-
-    daily_records = []
-    for d, c_val in sorted(daily_totals.items(), reverse=True):
-        ds = round(c_val * 3.0)
-        daily_records.append({
-            "date": d,
-            "orders_count": max(20, round(ds / 150)),
-            "gross_sales_rs": ds
-        })
-    if not daily_records:
-        daily_records = [{"date": stock_date, "orders_count": today_orders, "gross_sales_rs": today_sales}]
-
-    return {
-        "today_sales_rs": today_sales,
-        "sales_7d_rs": sales_7d,
-        "orders_today": today_orders,
-        "orders_7d": orders_7d,
-        "daily": daily_records
-    }
+        return {"status": "DATA_UNAVAILABLE", "error": "DATA_UNAVAILABLE", "message": "Actual sales data is unavailable"}
 
 
 @app.get("/api/sales")
 @auth("owner", "manager")
 def sales():
     data = get_sales_metrics()
+    if not data or data.get("status") == "DATA_UNAVAILABLE":
+        return jsonify({
+            "status": "DATA_UNAVAILABLE",
+            "error": "DATA_UNAVAILABLE",
+            "message": "Actual sales data is unavailable. Real sales are not derived from ingredient costs."
+        }), 200
+
     res = {
+        "status": "AVAILABLE",
         "today_sales_rs": data["today_sales_rs"],
         "sales_7d_rs": data["sales_7d_rs"],
         "orders_today": data["orders_today"],
@@ -376,9 +367,10 @@ def sales():
     }
     # Owner gets profit metrics, Manager does NOT get costs or profit margins
     if request.user["role"] == "owner":
-        res["cost_of_food_rs"] = round(data["today_sales_rs"] / 3.0)
-        res["gross_profit_rs"] = data["today_sales_rs"] - res["cost_of_food_rs"]
-        res["food_cost_pct"] = 33.3
+        cost_rows = db.query("SELECT * FROM ingredients")
+        res["cost_of_food_rs"] = None
+        res["gross_profit_rs"] = None
+        res["food_cost_pct"] = None
     return jsonify(res)
 
 
@@ -401,6 +393,9 @@ def dashboard():
     w = db.query("SELECT ingredient_id, SUM(wastage_qty) q, SUM(used_qty) u FROM manual_entries WHERE date>=? GROUP BY 1", (week,))
 
     sales_data = get_sales_metrics()
+    has_sales = bool(sales_data and sales_data.get("status") != "DATA_UNAVAILABLE")
+    sales_today = sales_data["today_sales_rs"] if has_sales else None
+    sales_7d = sales_data["sales_7d_rs"] if has_sales else None
 
     if role == "staff":
         # Strictly zero sales, revenue, purchase costs, stock valuation, or profit for staff
@@ -417,7 +412,7 @@ def dashboard():
             "sales_7d_rs": None,
         }
     elif role == "manager":
-        # Manager: access to sales figures and operational inventory; NO purchase costs, unit costs, valuation, or profit
+        # Manager: access to real sales figures if available; NO purchase costs, unit costs, valuation, or profit
         cards = {
             "ingredients": len(rows),
             "low_stock": sum(r["status"] == "Low stock" for r in rows),
@@ -427,8 +422,8 @@ def dashboard():
             "order_value_rs": None,
             "wastage_7d_rs": None,
             "usage_7d_rs": None,
-            "sales_today_rs": sales_data["today_sales_rs"],
-            "sales_7d_rs": sales_data["sales_7d_rs"],
+            "sales_today_rs": sales_today,
+            "sales_7d_rs": sales_7d,
         }
     else:  # owner: full financial and operational view
         cards = {
@@ -440,8 +435,8 @@ def dashboard():
             "order_value_rs": round(sum(r["order_qty"] * cost[r["ingredient_id"]] for r in rows)),
             "wastage_7d_rs": round(sum((x["q"] or 0) * cost[x["ingredient_id"]] for x in w)),
             "usage_7d_rs": round(sum((x["u"] or 0) * cost[x["ingredient_id"]] for x in w)),
-            "sales_today_rs": sales_data["today_sales_rs"],
-            "sales_7d_rs": sales_data["sales_7d_rs"],
+            "sales_today_rs": sales_today,
+            "sales_7d_rs": sales_7d,
         }
 
     return jsonify({
@@ -575,25 +570,29 @@ def manual_save():
             else:
                 idemp_base = f"{b['idempotency_key']}_rev{rev_count}"
 
+        ing_row = con.execute("SELECT unit FROM ingredients WHERE ingredient_id=?", (ing,)).fetchone()
+        canonical_unit = ing_row["unit"] if ing_row else "kg"
+        item_unit = b.get("unit") or canonical_unit
+
         # Post new transactions to the immutable journal
         if received > 0:
             ledger.post_transaction(
                 ingredient_id=ing, transaction_type="STOCK_IN", quantity=received, delta_qty=+received,
-                unit="kg", actor=user_name, source_channel="MANUAL_FORM", reference_id=ref_id,
+                unit=item_unit, actor=user_name, source_channel="MANUAL_FORM", reference_id=ref_id,
                 batch_no=batch, expiry_date=b.get("expiry_date"), idempotency_key=f"{idemp_base}_IN",
                 notes=f"Stock receipt on {date}", allow_negative=True, con=con
             )
         if used > 0:
             ledger.post_transaction(
                 ingredient_id=ing, transaction_type="CONSUMPTION", quantity=used, delta_qty=-used,
-                unit="kg", actor=user_name, source_channel="MANUAL_FORM", reference_id=ref_id,
+                unit=item_unit, actor=user_name, source_channel="MANUAL_FORM", reference_id=ref_id,
                 idempotency_key=f"{idemp_base}_USE", notes=f"Daily kitchen usage on {date}",
                 allow_negative=True, con=con
             )
         if waste > 0:
             ledger.post_transaction(
                 ingredient_id=ing, transaction_type="WASTAGE", quantity=waste, delta_qty=-waste,
-                unit="kg", actor=user_name, source_channel="MANUAL_FORM", reference_id=ref_id,
+                unit=item_unit, actor=user_name, source_channel="MANUAL_FORM", reference_id=ref_id,
                 idempotency_key=f"{idemp_base}_WASTE", notes=b.get("wastage_reason") or f"Kitchen wastage on {date}",
                 allow_negative=True, con=con
             )
@@ -681,13 +680,20 @@ def traditional_upload():
             (now_ts, actor, "DOCUMENT_UPLOAD", f"{upload_id} {file.filename} type={workflow_type} status={extracted['status']}")
         )
 
+    role = request.user["role"]
+    out_rows = [dict(r) for r in extracted["rows"]]
+    if role in ("staff", "manager"):
+        for r in out_rows:
+            r.pop("unit_price_rs", None)
+            r.pop("line_total_rs", None)
+
     return jsonify({
         "upload_id": upload_id,
         "filename": file.filename,
         "file_type": extracted["file_type"],
         "workflow_type": workflow_type,
         "status": extracted["status"],
-        "rows": extracted["rows"],
+        "rows": out_rows,
         "notes": extracted.get("notes", "")
     }), 201
 
@@ -730,6 +736,8 @@ def get_staged_document(upload_id):
         for r in rows:
             if "unit_price_rs" in r:
                 r["unit_price_rs"] = None
+            if "line_total_rs" in r:
+                r["line_total_rs"] = None
     return jsonify({
         "upload_id": doc["upload_id"],
         "filename": doc["filename"],
@@ -822,6 +830,7 @@ def update_staged_document(upload_id):
     if role in ("staff", "manager"):
         for r in out_rows:
             r["unit_price_rs"] = None
+            r["line_total_rs"] = None
 
     return jsonify({
         "status": "updated",
@@ -852,6 +861,34 @@ def download_staged_document_file(upload_id):
     file_real = os.path.realpath(raw_path)
     if not file_real.startswith(upload_dir_real) or not os.path.isfile(file_real):
         return jsonify(error="File not found on server"), 404
+
+    # Redact financial columns from downloaded CSV files for Staff and Manager
+    if role in ("staff", "manager") and (doc["file_type"] == "csv" or file_real.lower().endswith(".csv")):
+        import csv
+        with open(file_real, "r", encoding="utf-8", errors="ignore") as f_in:
+            reader = csv.reader(f_in)
+            csv_rows = list(reader)
+        if csv_rows:
+            header = [h.strip().lower() for h in csv_rows[0]]
+            redact_indices = {
+                i for i, h in enumerate(header)
+                if h in ("unit_price_rs", "line_total_rs", "unit_price", "price", "line_total", "total_amount_rs")
+            }
+            if redact_indices:
+                clean_rows = []
+                for row in csv_rows:
+                    clean_row = [val for i, val in enumerate(row) if i not in redact_indices]
+                    clean_rows.append(clean_row)
+                out_io = io.StringIO()
+                writer = csv.writer(out_io)
+                writer.writerows(clean_rows)
+                mem = io.BytesIO(out_io.getvalue().encode("utf-8"))
+                return send_file(
+                    mem,
+                    mimetype="text/csv",
+                    as_attachment=True,
+                    download_name=doc.get("filename") or os.path.basename(file_real)
+                )
 
     return send_file(
         file_real,
@@ -939,7 +976,22 @@ def traditional_post_opening():
         adjustments_posted = []
         for item in counts:
             iid = item["ingredient_id"]
-            qty = round(float(item["physical_qty"]), 4)
+            if iid not in ing_recs:
+                return jsonify(error=f"Unknown ingredient_id '{iid}'"), 422
+            canonical_unit = ing_recs[iid]["unit"]
+            item_unit = (item.get("unit") or canonical_unit).strip()
+
+            try:
+                raw_qty = float(item["physical_qty"])
+            except (KeyError, ValueError, TypeError):
+                return jsonify(error=f"Invalid physical quantity for {iid}"), 422
+            if raw_qty < 0:
+                return jsonify(error=f"Opening physical stock cannot be negative (got {raw_qty})"), 422
+
+            if not units.is_compatible_unit(item_unit, canonical_unit):
+                return jsonify(error=f"Incompatible unit '{item_unit}' for {iid} (expected '{canonical_unit}')"), 422
+
+            qty = units.convert_quantity(raw_qty, from_unit=item_unit, to_unit=canonical_unit)
             notes = item.get("notes") or ""
             ref_id = f"OPENING_DISCREPANCY:{date}:{iid}"
 
@@ -1109,11 +1161,14 @@ def traditional_post_delivery():
         ).fetchall()
         if existing_items:
             def item_signature(it):
+                iid = it.get("ingredient_id")
+                b = (it.get("batch_no") or "").strip() or f"{iid}-D{inv_date.replace('-', '')}"
+                e = (it.get("expiry_date") or "").strip() or None
                 return (
-                    it.get("ingredient_id"),
+                    iid,
                     round(float(it.get("billed_qty") or 0.0), 4),
-                    (it.get("batch_no") or "").strip(),
-                    (it.get("expiry_date") or "").strip()
+                    b,
+                    e or ""
                 )
 
             existing_sigs = sorted([
@@ -1170,16 +1225,20 @@ def traditional_post_delivery():
                 "expiry_date": expiry
             })
 
-        con.execute(
-            """
-            INSERT INTO supplier_invoices (
-                invoice_id, supplier_name, invoice_no, invoice_date, total_amount_rs,
-                status, received_by, verified_by, verified_at, document_upload_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, 'POSTED', ?, ?, ?, ?, ?)
-            ON CONFLICT(supplier_name, invoice_no) DO UPDATE SET total_amount_rs = excluded.total_amount_rs
-            """,
-            (inv_id, supplier, inv_no, inv_date, round(total_amt, 2), actor, actor, now_ts, doc_id, now_ts)
-        )
+        try:
+            con.execute(
+                """
+                INSERT INTO supplier_invoices (
+                    invoice_id, supplier_name, invoice_no, invoice_date, total_amount_rs,
+                    status, received_by, verified_by, verified_at, document_upload_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'POSTED', ?, ?, ?, ?, ?)
+                """,
+                (inv_id, supplier, inv_no, inv_date, round(total_amt, 2), actor, actor, now_ts, doc_id, now_ts)
+            )
+        except sqlite3.IntegrityError:
+            return jsonify(
+                error=f"Invoice '{inv_no}' from '{supplier}' has already been posted. Deliveries cannot be posted twice."
+            ), 409
 
         posted_items = []
         for nit in normalized_items:
@@ -1209,20 +1268,25 @@ def traditional_post_delivery():
             )
 
             item_id = f"ITM_{uuid.uuid4().hex[:10]}"
-            con.execute(
-                """
-                INSERT INTO supplier_invoice_items (
-                    item_id, invoice_id, supplier_name, invoice_no, ingredient_id,
-                    billed_qty, unit, inventory_qty, unit_price_rs, line_total_rs, batch_no,
-                    expiry_date, transaction_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    item_id, inv_id, supplier, inv_no, iid, nit["billed_qty"], nit["billed_unit"],
-                    nit["inventory_qty"], nit["unit_price_rs"], nit["line_total_rs"], batch,
-                    expiry, tx.get("transaction_id"), now_ts
+            try:
+                con.execute(
+                    """
+                    INSERT INTO supplier_invoice_items (
+                        item_id, invoice_id, supplier_name, invoice_no, ingredient_id,
+                        billed_qty, unit, inventory_qty, unit_price_rs, line_total_rs, batch_no,
+                        expiry_date, transaction_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item_id, inv_id, supplier, inv_no, iid, nit["billed_qty"], nit["billed_unit"],
+                        nit["inventory_qty"], nit["unit_price_rs"], nit["line_total_rs"], batch,
+                        expiry, tx.get("transaction_id"), now_ts
+                    )
                 )
-            )
+            except sqlite3.IntegrityError:
+                return jsonify(
+                    error=f"Duplicate line item detected on invoice '{inv_no}' for ingredient '{iid}' batch '{batch}'"
+                ), 409
             item_resp = {
                 "item_id": item_id,
                 "ingredient_id": iid,
@@ -1386,9 +1450,28 @@ def traditional_post_closing():
         ).fetchall()
         deliveries_map = {r[0]: float(r[1]) for r in deliveries_rows}
 
+        ing_rows = con.execute("SELECT ingredient_id, name, unit FROM ingredients").fetchall()
+        ing_map = {r[0]: {"name": r[1], "unit": r[2]} for r in ing_rows}
+
         for item in counts:
             iid = item["ingredient_id"]
-            closing_qty = round(float(item["physical_qty"]), 4)
+            if iid not in ing_map:
+                return jsonify(error=f"Unknown ingredient_id '{iid}'"), 422
+
+            canonical_unit = ing_map[iid]["unit"]
+            item_unit = (item.get("unit") or canonical_unit).strip()
+
+            try:
+                raw_closing = float(item["physical_qty"])
+            except (KeyError, ValueError, TypeError):
+                return jsonify(error=f"Invalid physical quantity for {iid}"), 422
+            if raw_closing < 0:
+                return jsonify(error=f"Closing physical stock cannot be negative (got {raw_closing})"), 422
+
+            if not units.is_compatible_unit(item_unit, canonical_unit):
+                return jsonify(error=f"Incompatible unit '{item_unit}' for {iid} (expected '{canonical_unit}')"), 422
+
+            closing_qty = units.convert_quantity(raw_closing, from_unit=item_unit, to_unit=canonical_unit)
             notes = item.get("notes") or ""
 
             opening_qty = openings_map.get(iid, ledger.get_book_balance(iid, con=con))
@@ -1418,14 +1501,14 @@ def traditional_post_closing():
                 except ValueError:
                     pass
 
-            # Post closing reconciliation movement EXACTLY ONCE
+            # Post closing reconciliation movement EXACTLY ONCE with canonical unit
             if depletion >= 0:
                 tx = ledger.post_transaction(
                     ingredient_id=iid,
                     transaction_type="CONSUMPTION",
                     quantity=depletion,
                     delta_qty=-depletion,
-                    unit="kg",
+                    unit=canonical_unit,
                     actor=actor,
                     source_channel="CLOSING_COUNT",
                     reference_id=ref_id,
@@ -1441,7 +1524,7 @@ def traditional_post_closing():
                     transaction_type="ADJUSTMENT",
                     quantity=overage,
                     delta_qty=+overage,
-                    unit="kg",
+                    unit=canonical_unit,
                     actor=actor,
                     source_channel="CLOSING_COUNT",
                     reference_id=ref_id,
@@ -2614,6 +2697,8 @@ def report(name):
                             "USING (ingredient_id) WHERE m.wastage_qty>0 ORDER BY m.date DESC")
     elif name == "sales":
         sales_data = get_sales_metrics()
+        if not sales_data or sales_data.get("status") == "DATA_UNAVAILABLE":
+            return jsonify(error="DATA_UNAVAILABLE", message="Actual sales data is unavailable"), 404
         rows = sales_data["daily"]
     elif name == "manual_register":
         rows = db.query("SELECT m.date, i.name ingredient, i.unit, m.opening_stock, m.received_qty, m.batch_no, m.expiry_date,"

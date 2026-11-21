@@ -47,6 +47,7 @@ def run_migrations(con=None):
     """
     Applies all pending migrations in order inside atomic transactions.
     Preserves all existing data and enforces foreign keys.
+    Guarantees that failed migrations are rolled back completely and never recorded as applied.
     """
     own_connection = con is None
     if own_connection:
@@ -66,30 +67,55 @@ def run_migrations(con=None):
                 sql = f.read()
 
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Deterministic compatibility handling for legacy databases where migration 007
+            # was pre-applied by legacy helper functions without recording version 7.
+            if version == 7:
+                try:
+                    user_cols = [r[1] for r in con.execute("PRAGMA table_info(users)").fetchall()]
+                    if "is_active" in user_cols:
+                        con.execute(
+                            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                            (version, name, now_str)
+                        )
+                        con.commit()
+                        newly_applied.append(name)
+                        continue
+                except Exception:
+                    pass
+
+            # Separate non-transactional PRAGMAs from transactional body
+            lines = sql.strip().splitlines()
+            pragmas = []
+            body_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.upper().startswith("PRAGMA "):
+                    pragmas.append(stripped)
+                else:
+                    body_lines.append(line)
+
+            for p in pragmas:
+                con.execute(p)
+
+            body_sql = "\n".join(body_lines).strip()
+
             try:
-                # In SQLite, executescript issues a COMMIT if there is an open transaction.
-                # To guarantee atomicity, we wrap each script in an explicit transaction block.
-                con.execute("BEGIN TRANSACTION")
-                con.executescript(sql)
+                if body_sql:
+                    # Executes the migration script body wrapped in an explicit transaction block
+                    con.executescript("BEGIN TRANSACTION;\n" + body_sql + "\nCOMMIT;")
+
                 con.execute(
                     "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
                     (version, name, now_str)
                 )
-                con.execute("COMMIT")
+                con.commit()
                 newly_applied.append(name)
             except Exception as e:
                 try:
                     con.execute("ROLLBACK")
                 except Exception:
                     pass
-                if "duplicate column name" in str(e).lower():
-                    con.execute(
-                        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
-                        (version, name, now_str)
-                    )
-                    con.commit()
-                    newly_applied.append(name)
-                    continue
                 raise RuntimeError(f"Database migration '{name}' (v{version}) failed: {e}") from e
 
         return newly_applied

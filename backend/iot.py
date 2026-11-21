@@ -3,10 +3,12 @@ SmartStock AI — IoT Ingestion, Barcode Refill Sessions, and Telemetry Reliabil
 Provides collision-resistant session IDs, temporal validation, idempotent completion,
 and strictly prevents synthetic telemetry injection into raw hardware reading streams.
 """
+import sqlite3
 import uuid
 from datetime import datetime, timedelta
 import db
 import ledger
+import units
 
 REFILL_MIN_KG = 0.2          # tau_r: minimum accepted refill
 SESSION_TIMEOUT_MIN = 10
@@ -110,7 +112,7 @@ def ingest(payload, api_key, source="live"):
 
 
 def latest_stable(device_id, source=None, after_ts=None):
-    """Fetches the latest stable reading for a device, optionally after a specified timestamp."""
+    """Fetches the latest stable reading for a device, optionally filtering by source and strictly after after_ts."""
     sql = "SELECT * FROM iot_readings WHERE device_id=? AND stable=1"
     args = [device_id]
     if source:
@@ -132,6 +134,10 @@ def resolve_barcode(code):
 def open_session(barcode, user, batch_no=None, expiry_date=None):
     """
     Opens a tare-locked barcode refill session with a collision-resistant UUID session key.
+    Enforces that:
+    1. The barcode corresponds to an ingredient with an assigned device scale.
+    2. No other refill session is currently OPEN for that device (database constraint + check).
+    3. A stable live reading exists from the physical device.
     """
     ing = resolve_barcode(barcode)
     if not ing:
@@ -142,30 +148,41 @@ def open_session(barcode, user, batch_no=None, expiry_date=None):
     if db.query("SELECT 1 FROM refill_sessions WHERE device_id=? AND status='OPEN'", (ing["device_id"],)):
         return 409, {"error": "a refill session is already open for this device"}
 
-    base = latest_stable(ing["device_id"], "live") or latest_stable(ing["device_id"])
+    base = latest_stable(ing["device_id"], source="live") or latest_stable(ing["device_id"])
     if not base:
         return 409, {"error": "no stable reading yet from the device"}
 
     # Collision-resistant session key (microsecond resolution + random hex)
     sid = f"RS{datetime.now():%y%m%d%H%M%S}_{uuid.uuid4().hex[:6]}"
 
-    with db.tx() as con:
-        con.execute(
-            """
-            INSERT INTO refill_sessions (
-                session_id, device_id, ingredient_id, started_at, weight_before_kg,
-                batch_no, expiry_date, scanned_by, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
-            """,
-            (
-                sid, ing["device_id"], ing["ingredient_id"], now_str(), base["weight_kg"],
-                batch_no, expiry_date, user
+    try:
+        with db.tx() as con:
+            # Check for existing open session inside the transaction
+            existing = con.execute(
+                "SELECT session_id FROM refill_sessions WHERE device_id=? AND status='OPEN'",
+                (ing["device_id"],)
+            ).fetchone()
+            if existing:
+                return 409, {"error": "a refill session is already open for this device"}
+
+            con.execute(
+                """
+                INSERT INTO refill_sessions (
+                    session_id, device_id, ingredient_id, started_at, weight_before_kg,
+                    batch_no, expiry_date, scanned_by, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+                """,
+                (
+                    sid, ing["device_id"], ing["ingredient_id"], now_str(), base["weight_kg"],
+                    batch_no, expiry_date, user
+                )
             )
-        )
-        con.execute(
-            "INSERT INTO audit_log (ts, actor, action, detail) VALUES (?, ?, ?, ?)",
-            (now_str(), user, "REFILL_OPEN", f"{sid} {ing['name']} base={base['weight_kg']}")
-        )
+            con.execute(
+                "INSERT INTO audit_log (ts, actor, action, detail) VALUES (?, ?, ?, ?)",
+                (now_str(), user, "REFILL_OPEN", f"{sid} {ing['name']} base={base['weight_kg']}")
+            )
+    except sqlite3.IntegrityError:
+        return 409, {"error": "a refill session is already open for this device"}
 
     return 201, {
         "session_id": sid,
@@ -180,9 +197,12 @@ def complete_session(sid, user):
     """
     Completes a refill session. Enforces:
     1. Idempotency: multiple completion calls return the existing completed result.
-    2. Freshness: requires a stable reading taken strictly after session start.
+    2. Freshness & Physical Confirmation: strictly requires a fresh stable physical reading
+       (source='live' measured strictly after session start). Simulated or historical readings
+       must not qualify as physical confirmation.
     3. Minimum threshold: rejects refills below REFILL_MIN_KG (0.2 kg).
-    4. Auditable transaction: logs the refill in inventory_transactions (delta = 0).
+    4. Atomicity: session completion and inventory ledger posting succeed or fail together.
+       Ledger exceptions are never silently swallowed.
     """
     s_list = db.query("SELECT * FROM refill_sessions WHERE session_id=?", (sid,))
     if not s_list:
@@ -205,13 +225,13 @@ def complete_session(sid, user):
         _close(sid, "REJECTED", None, None, "session timed out", user)
         return 409, {"error": "session timed out - scan again"}
 
-    # Must require a fresh stable reading measured strictly AFTER session start
-    after = latest_stable(s["device_id"], "live", after_ts=s["started_at"]) or \
-            latest_stable(s["device_id"], after_ts=s["started_at"])
+    # Strictly require a fresh stable physical reading measured strictly AFTER session start with source='live'.
+    # Historical or simulated readings must not qualify as physical confirmation.
+    after = latest_stable(s["device_id"], source="live", after_ts=s["started_at"])
 
     if not after:
         return 409, {
-            "error": "no fresh stable reading after refill session start - ensure scale has stabilized",
+            "error": "no fresh stable reading from physical sensor after refill session start - ensure scale has stabilized",
             "status": "WAITING_FOR_READING"
         }
 
@@ -220,16 +240,39 @@ def complete_session(sid, user):
         _close(sid, "REJECTED", after["weight_kg"], delta, f"weight increase {delta:.2f} kg below threshold", user)
         return 422, {"error": f"no valid refill detected (change {delta:.2f} kg)", "status": "REJECTED"}
 
-    _close(sid, "COMPLETED", after["weight_kg"], delta, None, user)
+    # Fetch canonical unit for ingredient
+    ing = db.query("SELECT unit FROM ingredients WHERE ingredient_id=?", (s["ingredient_id"],))
+    canonical_unit = ing[0]["unit"] if ing else "kg"
 
-    # Post auditable REFILL transaction into the inventory journal
-    try:
+    if units.is_compatible_unit("kg", canonical_unit) and canonical_unit != "kg":
+        refill_qty = units.convert_quantity(delta, from_unit="kg", to_unit=canonical_unit)
+    else:
+        refill_qty = round(delta, 3)
+
+    now_ts = now_str()
+
+    # Atomic session completion AND ledger posting inside a single transaction.
+    # Never silently swallow ledger exceptions.
+    with db.tx() as con:
+        con.execute(
+            """
+            UPDATE refill_sessions
+            SET status='COMPLETED', completed_at=?, weight_after_kg=?, refill_kg=?, reason=NULL
+            WHERE session_id=?
+            """,
+            (now_ts, after["weight_kg"], round(delta, 3), sid)
+        )
+        con.execute(
+            "INSERT INTO audit_log (ts, actor, action, detail) VALUES (?, ?, ?, ?)",
+            (now_ts, user, "REFILL_COMPLETED", f"{sid} delta={round(delta, 3)} kg")
+        )
+
         ledger.post_transaction(
             ingredient_id=s["ingredient_id"],
             transaction_type="REFILL",
-            quantity=round(delta, 3),
-            delta_qty=0.0,  # Refill into kitchen bin is an internal movement; leaves total inventory invariant
-            unit="kg",
+            quantity=round(refill_qty, 3),
+            delta_qty=0.0,
+            unit=canonical_unit,
             actor=user,
             source_channel="BARCODE",
             reference_id=sid,
@@ -238,9 +281,8 @@ def complete_session(sid, user):
             idempotency_key=f"REFILL_{sid}",
             notes=f"Refill session {sid} for {s['device_id']}: container weight increased by {round(delta, 3)} kg",
             allow_negative=True,
+            con=con,
         )
-    except Exception:
-        pass
 
     return 200, {
         "status": "COMPLETED",
@@ -279,28 +321,39 @@ def _close(sid, status, after, delta, reason, user):
 
 
 def spill_events(hours=None, source=None):
-    """Sudden stable-weight drops outside refill sessions (possible spillage/pilferage)."""
-    sql = "SELECT * FROM iot_readings WHERE stable=1 OR event_type!='READING'"
-    rows = db.query(sql + " ORDER BY device_id, ts, reading_id")
-    out, last, last_ts = [], {}, {}
+    """
+    Detects sudden drops outside active sessions.
+    Accepts source filtering: 'live', 'sim', or None (both).
+    """
+    sql = "SELECT * FROM iot_readings WHERE stable=1"
+    args = []
+    if source:
+        sql += " AND source=?"
+        args.append(source)
+    if hours:
+        since = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        sql += " AND ts>=?"
+        args.append(since)
+    sql += " ORDER BY device_id, ts ASC"
+
+    rows = db.query(sql, args)
+    events = []
+    by_dev = {}
     for r in rows:
-        if source and r["source"] != source:
-            continue
-        d = r["device_id"]
-        if r["event_type"] != "READING":
-            last[d] = r["weight_kg"] if r["event_type"] == "REFILL_END" else None
-            last_ts[d] = r["ts"]
-            continue
-        if last.get(d) is not None and last[d] - r["weight_kg"] > SPILL_DROP_KG:
-            gap = (datetime.strptime(r["ts"], "%Y-%m-%d %H:%M:%S")
-                   - datetime.strptime(last_ts[d], "%Y-%m-%d %H:%M:%S")).total_seconds()
-            if gap <= 600:
-                out.append({
-                    "device_id": d,
-                    "ingredient_id": r["ingredient_id"],
-                    "ts": r["ts"],
-                    "drop_kg": round(last[d] - r["weight_kg"], 2),
+        by_dev.setdefault(r["device_id"], []).append(r)
+
+    for dev_id, readings in by_dev.items():
+        for i in range(1, len(readings)):
+            prev, curr = readings[i - 1], readings[i]
+            drop = prev["weight_kg"] - curr["weight_kg"]
+            if drop >= SPILL_DROP_KG and not curr["session_id"]:
+                events.append({
+                    "device_id": dev_id,
+                    "ingredient_id": curr["ingredient_id"],
+                    "drop_kg": round(drop, 2),
+                    "before_kg": prev["weight_kg"],
+                    "after_kg": curr["weight_kg"],
+                    "ts": curr["ts"],
+                    "source": curr.get("source", "live")
                 })
-        last[d] = r["weight_kg"]
-        last_ts[d] = r["ts"]
-    return out
+    return events

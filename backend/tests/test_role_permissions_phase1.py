@@ -91,16 +91,14 @@ def test_staff_cannot_access_manager_endpoints(client, login):
 # 2. MANAGER PERMISSIONS & RESTRICTIONS
 # ------------------------------------------------------------------
 def test_manager_can_access_sales_data(client, login):
-    """Manager can access sales figures but NOT gross/net profit or purchase costs."""
+    """Manager accessing /api/sales when actual sales data is unavailable receives explicit DATA_UNAVAILABLE."""
     res = client.get("/api/sales", headers=login("manager"))
     assert res.status_code == 200
     data = res.get_json()
 
-    # Must have sales figures
-    assert data["today_sales_rs"] > 0
-    assert data["sales_7d_rs"] > 0
-    assert data["orders_today"] > 0
-    assert isinstance(data["daily"], list)
+    # Must return explicit DATA_UNAVAILABLE status without fabricated numbers
+    assert data["status"] == "DATA_UNAVAILABLE"
+    assert data["error"] == "DATA_UNAVAILABLE"
 
     # Must NOT have profit or food cost fields
     assert "gross_profit_rs" not in data
@@ -109,24 +107,21 @@ def test_manager_can_access_sales_data(client, login):
 
 
 def test_manager_can_download_sales_report(client, login):
-    """Manager can download daily sales CSV report."""
+    """When sales data is unavailable, sales report returns explicit 404 DATA_UNAVAILABLE."""
     res = client.get("/api/reports/sales.csv", headers=login("manager"))
-    assert res.status_code == 200
-    assert "text/csv" in res.headers.get("Content-Type", "")
-    csv_text = res.get_data(as_text=True)
-    assert "date" in csv_text
-    assert "gross_sales_rs" in csv_text
+    assert res.status_code == 404
+    assert res.get_json().get("error") == "DATA_UNAVAILABLE"
 
 
 def test_manager_dashboard_sales_and_cost_redaction(client, login):
-    """Manager sees sales figures on dashboard, but purchase costs and stock valuation are redacted."""
+    """Manager dashboard cards redact purchase costs and report None when sales data is unavailable."""
     res = client.get("/api/dashboard", headers=login("manager"))
     assert res.status_code == 200
     cards = res.get_json()["cards"]
 
-    # Sales numbers must be present
-    assert cards["sales_today_rs"] is not None and cards["sales_today_rs"] > 0
-    assert cards["sales_7d_rs"] is not None and cards["sales_7d_rs"] > 0
+    # When actual sales data is unavailable, sales figures are None
+    assert cards["sales_today_rs"] is None
+    assert cards["sales_7d_rs"] is None
 
     # Purchase cost, stock valuation, and costed usage/wastage must be redacted
     assert cards["stock_value_rs"] is None
@@ -264,16 +259,15 @@ def test_owner_full_governance_and_financials(client, login):
     assert dash["cards"]["stock_value_rs"] > 0
     assert dash["cards"]["order_value_rs"] >= 0
     assert dash["cards"]["wastage_7d_rs"] >= 0
-    assert dash["cards"]["sales_today_rs"] > 0
+    assert dash["cards"]["sales_today_rs"] is None  # Actual sales data unavailable
 
     # 2. Unit costs in ingredients
     ings = client.get("/api/ingredients", headers=login("owner")).get_json()
     assert all(r["unit_cost_rs"] is not None and r["unit_cost_rs"] > 0 for r in ings)
 
-    # 3. Profit metrics in sales endpoint
+    # 3. Explicit DATA_UNAVAILABLE in sales endpoint
     sales = client.get("/api/sales", headers=login("owner")).get_json()
-    assert "gross_profit_rs" in sales
-    assert "cost_of_food_rs" in sales
+    assert sales["status"] == "DATA_UNAVAILABLE"
 
     # 4. Wastage valuation in reports
     wastage_csv = client.get("/api/reports/wastage.csv", headers=login("owner")).get_data(as_text=True)

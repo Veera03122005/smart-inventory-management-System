@@ -30,7 +30,8 @@ CANONICAL_UNITS = {
     "kg": "kg", "kilogram": "kg", "kilograms": "kg",
     "g": "g", "gram": "g", "grams": "g",
     "l": "L", "liter": "L", "liters": "L", "litre": "L", "litres": "L",
-    "ml": "ml", "milliliter": "ml", "milliliters": "ml", "millilitre": "ml", "millilitres": "ml"
+    "ml": "ml", "milliliter": "ml", "milliliters": "ml", "millilitre": "ml", "millilitres": "ml",
+    "pcs": "pcs", "piece": "pcs", "pieces": "pcs", "pack": "pack", "pkt": "pack"
 }
 
 
@@ -43,11 +44,16 @@ def normalize_unit_str(unit: str) -> str:
 def is_compatible_unit(from_unit: str, to_unit: str) -> bool:
     u1 = normalize_unit_str(from_unit)
     u2 = normalize_unit_str(to_unit)
+    if u1 == u2:
+        return True
     if u1 in MASS_FACTORS and u2 in MASS_FACTORS:
         return True
     if u1 in VOLUME_FACTORS and u2 in VOLUME_FACTORS:
         return True
     return False
+
+
+are_units_compatible = is_compatible_unit
 
 
 def convert_quantity(qty: float, from_unit: str, to_unit: str) -> float:

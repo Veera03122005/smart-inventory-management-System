@@ -2,10 +2,12 @@
 SmartStock AI — Authoritative Append-Only Inventory Movement Journal and Balance Reconciliation.
 Provides atomic postings, idempotency, compensating reversals, and projection reconciliation.
 """
+import math
 import uuid
 from datetime import datetime
 from decimal import Decimal
 import db
+import units
 
 VALID_TRANSACTION_TYPES = (
     "STOCK_IN",
@@ -71,13 +73,34 @@ def post_transaction(
 ):
     """
     Atomically posts an immutable inventory transaction.
-    Enforces idempotency, non-negative quantity parameter, balance constraints, and projection update.
+    Enforces idempotency, finite non-negative quantity parameter, balance constraints,
+    canonical unit validation, transaction type semantics, and projection update.
     """
+    # 1. Quantity and delta validation (guard against NaN, Infinity, and invalid quantities)
+    if quantity is None or not isinstance(quantity, (int, float, Decimal)) or math.isnan(float(quantity)) or math.isinf(float(quantity)):
+        raise ValueError(f"Invalid transaction quantity '{quantity}': cannot be None, NaN, or Infinite")
+
+    if delta_qty is None or not isinstance(delta_qty, (int, float, Decimal)) or math.isnan(float(delta_qty)) or math.isinf(float(delta_qty)):
+        raise ValueError(f"Invalid transaction delta_qty '{delta_qty}': cannot be None, NaN, or Infinite")
+
+    if float(quantity) < 0:
+        raise ValueError(f"Transaction quantity must be non-negative (received {quantity})")
+
+    # 2. Transaction type semantics validation
     if transaction_type not in VALID_TRANSACTION_TYPES:
         raise ValueError(f"Invalid transaction type '{transaction_type}'. Must be one of {VALID_TRANSACTION_TYPES}")
 
-    if quantity < 0:
-        raise ValueError(f"Transaction quantity must be non-negative (received {quantity})")
+    if transaction_type == "REVERSAL" and not reversal_ref_id:
+        raise ValueError("Reversal transaction must specify reversal_ref_id")
+
+    if transaction_type == "STOCK_IN" and float(delta_qty) < 0:
+        raise ValueError(f"STOCK_IN cannot have negative delta_qty ({delta_qty})")
+
+    if transaction_type in ("CONSUMPTION", "WASTAGE") and float(delta_qty) > 0:
+        raise ValueError(f"{transaction_type} cannot have positive delta_qty ({delta_qty})")
+
+    if transaction_type == "REFILL" and float(delta_qty) != 0:
+        raise ValueError(f"REFILL delta_qty must be 0 (received {delta_qty})")
 
     # Round deltas to 4 decimal places for precision
     qty_val = round(float(quantity), 4)
@@ -91,7 +114,7 @@ def post_transaction(
         tx_context = None
 
     try:
-        # 1. Idempotency Check
+        # 3. Idempotency Check
         if idempotency_key:
             existing = con.execute(
                 "SELECT * FROM inventory_transactions WHERE idempotency_key=?",
@@ -101,7 +124,7 @@ def post_transaction(
                 tx_dict = dict(existing)
                 return {"status": "duplicate", "transaction": tx_dict, "idempotent": True}
 
-        # 2. Ingredient validation
+        # 4. Ingredient and unit validation
         ing = con.execute(
             "SELECT ingredient_id, name, unit FROM ingredients WHERE ingredient_id=?",
             (ingredient_id,)
@@ -109,9 +132,23 @@ def post_transaction(
         if not ing:
             raise ValueError(f"Unknown ingredient_id '{ingredient_id}'")
 
-        unit = unit or ing["unit"]
+        auth_unit = ing["unit"]
+        if unit:
+            if not units.is_compatible_unit(unit, auth_unit):
+                raise ValueError(
+                    f"Incompatible unit '{unit}' for ingredient {ingredient_id} with canonical unit '{auth_unit}'"
+                )
+            if units.normalize_unit_str(unit) != units.normalize_unit_str(auth_unit):
+                factor = units.convert_quantity(1.0, from_unit=unit, to_unit=auth_unit)
+                qty_val = round(qty_val * factor, 4)
+                delta_val = round(delta_val * factor, 4)
+                unit = auth_unit
+            else:
+                unit = auth_unit
+        else:
+            unit = auth_unit
 
-        # 3. Balance verification (prevent unauthorized negative stock)
+        # 5. Balance verification (prevent unauthorized negative stock)
         current_balance = get_book_balance(ingredient_id, con=con)
         new_balance = round(current_balance + delta_val, 4)
 
@@ -122,11 +159,11 @@ def post_transaction(
                     f"{current_balance} {unit}, cannot apply delta {delta_val} {unit} (would result in {new_balance} {unit})"
                 )
 
-        # 4. Generate unique transaction ID
+        # 6. Generate unique transaction ID
         tx_id = f"TX{datetime.now():%y%m%d%H%M%S}_{uuid.uuid4().hex[:8]}"
         ts = timestamp or now_str()
 
-        # 5. Insert into immutable journal
+        # 7. Insert into immutable journal
         con.execute(
             """
             INSERT INTO inventory_transactions (
@@ -142,27 +179,30 @@ def post_transaction(
             )
         )
 
-        # 6. Update balance projection inside the same transaction
+        # 8. Update projected balance cache atomically
         con.execute(
             """
-            INSERT INTO inventory_balances (
-                ingredient_id, book_balance, last_transaction_id, last_updated_at
-            ) VALUES (?, ?, ?, ?)
+            INSERT INTO inventory_balances (ingredient_id, book_balance, last_transaction_id, last_updated_at)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(ingredient_id) DO UPDATE SET
                 book_balance = excluded.book_balance,
                 last_transaction_id = excluded.last_transaction_id,
                 last_updated_at = excluded.last_updated_at
             """,
-            (ingredient_id, new_balance, tx_id, now_str())
+            (ingredient_id, new_balance, tx_id, ts)
         )
 
-        # 7. Audit log event
+        # 9. Audit trail entry
         con.execute(
             "INSERT INTO audit_log (ts, actor, action, detail) VALUES (?, ?, ?, ?)",
-            (now_str(), actor, f"INVENTORY_{transaction_type}", f"{tx_id} {ingredient_id} delta={delta_val} new_bal={new_balance}")
+            (ts, actor, f"INVENTORY_{transaction_type}", f"{ingredient_id}: delta {delta_val} {unit} -> {new_balance} (ref: {reference_id or tx_id})")
         )
 
-        created_tx = {
+        if tx_context:
+            tx_context.__exit__(None, None, None)
+
+        return {
+            "status": "posted",
             "transaction_id": tx_id,
             "ingredient_id": ingredient_id,
             "quantity": qty_val,
@@ -173,18 +213,13 @@ def post_transaction(
             "reference_id": reference_id,
             "batch_no": batch_no,
             "expiry_date": expiry_date,
-            "timestamp": ts,
             "actor": actor,
             "idempotency_key": idempotency_key,
             "reversal_ref_id": reversal_ref_id,
+            "previous_balance": current_balance,
             "new_balance": new_balance,
-            "status": "posted"
+            "timestamp": ts,
         }
-
-        if tx_context:
-            tx_context.__exit__(None, None, None)
-
-        return created_tx
     except Exception as e:
         if tx_context:
             tx_context.__exit__(type(e), e, None)
@@ -196,12 +231,22 @@ def reverse_transaction(
     actor: str,
     reason: str,
     idempotency_key: str = None,
+    allow_negative: bool = True,
     con=None,
 ):
     """
-    Compensates an existing transaction by posting an equal and opposite REVERSAL.
-    Does not delete or mutate the original record.
+    Creates an immutable compensating REVERSAL transaction that negates the original delta.
+    Enforces that:
+    1. The original transaction exists.
+    2. A reversal cannot itself be reversed (prevents reversal cycles).
+    3. The original transaction has not already been reversed.
+    4. Non-empty actor and reason strings are provided.
     """
+    if not actor or not isinstance(actor, str) or not actor.strip():
+        raise ValueError("Actor string is required to reverse a transaction")
+    if not reason or not isinstance(reason, str) or not reason.strip():
+        raise ValueError("Reason string is required to reverse a transaction")
+
     own_connection = con is None
     if own_connection:
         tx_context = db.tx()
@@ -215,9 +260,13 @@ def reverse_transaction(
             (original_tx_id,)
         ).fetchone()
         if not orig:
-            raise ValueError(f"Cannot reverse non-existent transaction '{original_tx_id}'")
+            raise ValueError(f"Transaction '{original_tx_id}' not found")
 
         orig_dict = dict(orig)
+
+        # Prevent reversing a reversal transaction
+        if orig_dict["transaction_type"] == "REVERSAL":
+            raise ValueError(f"Cannot reverse a reversal transaction '{original_tx_id}'")
 
         # Check if already reversed
         already_reversed = con.execute(
@@ -244,7 +293,7 @@ def reverse_transaction(
             idempotency_key=rev_idemp,
             reversal_ref_id=original_tx_id,
             notes=f"Reversal of {original_tx_id}: {reason}",
-            allow_negative=True,
+            allow_negative=allow_negative,
             con=con,
         )
 
